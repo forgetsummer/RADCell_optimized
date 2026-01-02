@@ -811,22 +811,8 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
     // ---- 1) Check telomere condition (your threshold) ----
     const bool allowableInCellTelomereLength = (phase.telomereFraction > 8.88E-16);
 
-    // ---- 2) "Space allowable" check at the CURRENT location ----
-    // Note: Here we only decide whether cell should remain in cycling vs go to G0.
-    // We'll recompute candidate positions again at actual division time.
-    bool allowableInSpace = true;
-    if (considerContactInhibition)
-    {
-        auto possibleNow = CheckCellContactInhibitionCondition(pos.i, pos.j, pos.k);
-        allowableInSpace = !possibleNow.empty();
-    }
-    else
-    {
-        allowableInSpace = true; // by your design: ignore space constraint
-    }
-
-    // If environment not tolerable, go to G0
-    if (!allowableInCellTelomereLength || !allowableInSpace)
+    // If telomere too short, go to G0
+    if (!allowableInCellTelomereLength)
     {
         phase.phase = "G0";
         phase.age = 0;
@@ -834,7 +820,17 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         return;
     }
 
-    // ---- 3) Phase transitions ----
+    // ---- Helper lambda to check if space is available for division ----
+    auto hasSpaceForDivision = [&]() -> bool {
+        if (!considerContactInhibition) return true;
+        std::map<std::string, PositionInfo> possibleHomes = 
+            CheckCellContactInhibitionCondition(pos.i, pos.j, pos.k);
+        return !possibleHomes.empty();
+    };
+
+    // ---- 2) Phase transitions ----
+    
+    // G0 -> G1: Cell wakes up and enters cell cycle
     if (phase.phase == "G0")
     {
         phase.phase = "G1";
@@ -844,19 +840,35 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         return;
     }
 
+    // G1 -> S: Check contact inhibition before committing to DNA synthesis
+    // This is the first checkpoint - cells sense crowding before S phase
     if (phase.phase == "G1")
     {
         phase.age += increaseTime;
         if (phase.age > phase.duration)
         {
-            phase.phase = "S";
-            phase.age = 0;
-            phase.duration = GaussianSampling(cellCycleInfoMap.at(cellType).mTS,
-                                              cellCycleInfoMap.at(cellType).sigmaTS);
+            // Check contact inhibition at G1->S transition
+            if (hasSpaceForDivision())
+            {
+                // Space available - proceed to S phase
+                phase.phase = "S";
+                phase.age = 0;
+                phase.duration = GaussianSampling(cellCycleInfoMap.at(cellType).mTS,
+                                                  cellCycleInfoMap.at(cellType).sigmaTS);
+            }
+            else
+            {
+                // No space - enter quiescence (G0)
+                phase.phase = "G0";
+                phase.age = 0;
+                phase.duration = 1E+18;  // Long duration in G0
+            }
         }
         return;
     }
 
+    // S -> G2: DNA synthesis complete, proceed to G2
+    // No contact inhibition check here - cell is already committed
     if (phase.phase == "S")
     {
         phase.age += increaseTime;
@@ -870,19 +882,35 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         return;
     }
 
+    // G2 -> M: Check contact inhibition before committing to mitosis
+    // This is the second checkpoint - cells verify space before mitosis
     if (phase.phase == "G2")
     {
         phase.age += increaseTime;
         if (phase.age > phase.duration)
         {
-            phase.phase = "M";
-            phase.age = 0;
-            phase.duration = GaussianSampling(cellCycleInfoMap.at(cellType).mTM,
-                                              cellCycleInfoMap.at(cellType).sigmaTM);
+            // Check contact inhibition at G2->M transition
+            if (hasSpaceForDivision())
+            {
+                // Space available - proceed to M phase
+                phase.phase = "M";
+                phase.age = 0;
+                phase.duration = GaussianSampling(cellCycleInfoMap.at(cellType).mTM,
+                                                  cellCycleInfoMap.at(cellType).sigmaTM);
+            }
+            else
+            {
+                // No space - enter quiescence (G0)
+                phase.phase = "G0";
+                phase.age = 0;
+                phase.duration = 1E+18;
+            }
         }
         return;
     }
 
+    // M phase: Cell division (mitosis)
+    // At this point, space was already verified at G2->M transition
     if (phase.phase == "M")
     {
         phase.age += increaseTime;
@@ -890,8 +918,8 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         if (phase.age <= phase.duration)
             return;
 
-        // ---- 4) Division happens now ----
-        // Recompute possible positions NOW (not earlier) to avoid stale neighbor list.
+        // ---- Division happens now ----
+        // Recompute possible positions (space may have changed during M phase)
         std::map<std::string, PositionInfo> possibleCellHomeForMitosis;
         if (considerContactInhibition)
         {
@@ -899,12 +927,11 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         }
         else
         {
-            // Your current design: ignore space => allow "original".
-            // NOTE: This allows both daughters in same voxel unless you later resolve overlaps.
+            // No contact inhibition - allow division at original position
             possibleCellHomeForMitosis.emplace("original", pos);
         }
 
-        // Defensive: if CI enabled but no space now, push to G0 instead of crashing / undefined.
+        // If no space available now (rare - space was checked at G2->M), go to G0
         if (possibleCellHomeForMitosis.empty())
         {
             phase.phase = "G0";
@@ -913,7 +940,7 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
             return;
         }
 
-        // Find max existing cellID (you can later optimize with nextCellID)
+        // Find max existing cellID
         int cellID_max = 0;
         for (auto it = cellPhaseMap.begin(); it != cellPhaseMap.end(); ++it)
             cellID_max = std::max(cellID_max, it->first);
@@ -925,8 +952,9 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         const double motherTel = phase.telomereFraction;
         const int motherAncestry = phase.ancestryID;
         const PositionInfo motherPos = pos;
+        const Cell motherCellType = itType->second;
 
-        // Daughter 1
+        // Daughter 1: takes mother's position
         cellPhaseMap[id1].phase = "G0";
         cellPhaseMap[id1].age = 0;
         cellPhaseMap[id1].duration = 1E+18;
@@ -937,10 +965,11 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellStateMap[id1].age = 0;
         cellStateMap[id1].duration = 1E+18;
 
-        cellPositionMap[id1] = motherPos; // first daughter takes mother's place
-        cellHomeResidence[motherPos.i][motherPos.j][motherPos.k] = 1; // keep occupied
+        cellPositionMap[id1] = motherPos;
+        cellHomeResidence[motherPos.i][motherPos.j][motherPos.k] = 1;
+        cellTypeMap[id1] = motherCellType;
 
-        // Daughter 2 (random pick)
+        // Daughter 2: random position from available spaces
         const int n  = (int)possibleCellHomeForMitosis.size();
         const int ii = (int)std::floor(UniformRand() * n);
         auto pick = possibleCellHomeForMitosis.begin();
@@ -958,12 +987,13 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
 
         cellPositionMap[id2] = pick->second;
         cellHomeResidence[pick->second.i][pick->second.j][pick->second.k] = 1;
+        cellTypeMap[id2] = motherCellType;
 
-        // Delete mother
+        // Delete mother cell
         cellPhaseMap.erase(cellID);
         cellStateMap.erase(cellID);
         cellPositionMap.erase(cellID);
-        // (Optionally erase proliferative flag too, if you maintain it per-cell)
+        cellTypeMap.erase(cellID);
         cellProliferativeMap.erase(cellID);
 
         return;

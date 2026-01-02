@@ -66,20 +66,20 @@ int main(int argc, char** argv)
     createDirectoryIfNotExists("./phase_output");
 
     //------------------------------------------------------------------------
-    // Simulation Parameters (from original test file)
+    // Simulation Parameters (SAME as old version test_phaseTransition.cc)
     //------------------------------------------------------------------------
     double xDim = 1.0;    // unit in mm
     double yDim = 1.0;    // unit in mm
     double zDim = 0.0;    // unit in mm (2D monolayer)
     double d = 0.01;      // grid size, unit in mm
     
-    // Time parameters
+    // Time parameters (SAME as old version)
     double T = 10.0;                    // time step for one MCS, unit in second
     double deltaT_cellPhaseUpdate = 60; // unit in second
     int totalTimeStepNum = 60480;       // total time steps
-    int cellNum = 1000;                 // number of cells
+    int cellNum = 1;                    // number of cells - START WITH 1 CELL FOR COMPARISON TEST
     
-    // Cell cycle parameters (from original test)
+    // Cell cycle parameters (SAME as old version)
     double tG1 = 9.0;       // mean G1 duration, unit in hour
     double sigmaG1 = 1.8;   // G1 std dev
     double tS = 11.0;       // mean S duration
@@ -213,13 +213,13 @@ int main(int argc, char** argv)
     }
 
     //------------------------------------------------------------------------
-    // Initialize cell phases randomly
+    // Initialize cell phases - START WITH G1 PHASE FOR COMPARISON TEST
     //------------------------------------------------------------------------
-    cout << "\n--- Initializing Cell Phases Randomly ---" << endl;
+    cout << "\n--- Initializing Cell Phase to G1 ---" << endl;
     
     for (int i = 0; i < cellNum; i++) {
-        // NEW API: CellPhaseInitializationRandom only takes cellID
-        myCellState.CellPhaseInitializationRandom(i);
+        // Initialize to G1 phase for controlled comparison
+        myCellState.CellPhaseInitialization(i, "G1");
     }
 
     //------------------------------------------------------------------------
