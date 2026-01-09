@@ -1029,6 +1029,29 @@ void CellStateModel::CellStateUpdate(int cellID,
     // external perturbation energy (store/update per cell)
     cellExternalPerturbationEnergyMap[cellID] = alpha * DSBNum + beta * integralConcentration;
 
+    auto& st = itState->second;
+
+    const double dt_h = increaseTime; // hours
+    const double dEinj = cellExternalPerturbationEnergyMap.at(cellID);
+
+    // bi-exponential repair parameters (must be available in your param struct)
+    double f1 = cellStateParaInfoMap.at(cellType).f1;
+    double f2 = cellStateParaInfoMap.at(cellType).f2;
+    const double lambda1 = cellStateParaInfoMap.at(cellType).lambda1; // 1/hour
+    const double lambda2 = cellStateParaInfoMap.at(cellType).lambda2; // 1/hour
+
+    // normalize weights defensively (recommended)
+    const double s = f1 + f2;
+    if (s > 0.0) { f1 /= s; f2 /= s; } else { f1 = 1.0; f2 = 0.0; }
+
+    // combined decay factor over this step
+    const double decay =
+        f1 * std::exp(-lambda1 * dt_h) +
+        f2 * std::exp(-lambda2 * dt_h);
+
+    // update state energy
+    st.E = st.E * decay + dEinj;
+
     // instantaneous vs delayed transition type
     const bool transitionType = (DSBNum > 0);
 

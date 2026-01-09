@@ -30,6 +30,7 @@ endif()
 add_subdirectory(CellMaker)
 add_subdirectory(ReactionDiffusionSolver)
 add_subdirectory(PhysicalBioTranslator)
+add_subdirectory(PIDEDataReader)
 
 #----------------------------------------------------------------------------
 # Locate sources and headers for the main project
@@ -39,6 +40,7 @@ include_directories(${PROJECT_SOURCE_DIR}/include
                     ${PROJECT_SOURCE_DIR}/CellMaker/include
                     ${PROJECT_SOURCE_DIR}/ReactionDiffusionSolver/include
                     ${PROJECT_SOURCE_DIR}/PhysicalBioTranslator/include
+                    ${PROJECT_SOURCE_DIR}/PIDEDataReader/include
                     ${Geant4_INCLUDE_DIR})
 
 # Get all source files except those in modules
@@ -109,6 +111,7 @@ install(TARGETS radcelllib DESTINATION lib)
 install(TARGETS CellMaker DESTINATION lib)
 install(TARGETS ReactionDiffusionSolver DESTINATION lib)
 install(TARGETS PhysicalBioTranslator DESTINATION lib)
+install(TARGETS PIDEDataReader DESTINATION lib)
 
 #----------------------------------------------------------------------------
 # Python wrapper subdirectory
