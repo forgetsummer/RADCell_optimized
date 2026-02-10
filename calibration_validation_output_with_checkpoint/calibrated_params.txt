@@ -1,0 +1,34 @@
+=== Calibration Validation Results ===
+
+Input LQ Parameters:
+  alpha_LQ = 0.75 Gy^-1
+  beta_LQ = 0.11 Gy^-2
+
+Calibrated Reduced Parameters (fitted):
+  e2 = 3.62297
+  e3 = 6.94853
+  a = 0.0529459
+  k_error = 1e-10 per (DSB*hour)
+
+Optimized Timescales:
+  T21 = 10 hours (from optimization)
+  T23 = 10 hours (from optimization)
+
+Calibrated Physical Parameters (sigma=10):
+  E1 = 0
+  E2 = 36.2297
+  E3 = 69.4853
+  sigma = 10
+  alpha = 0.529459
+  kappa = 40 DSB/Gy
+  k_error = 1e-10 per (DSB*hour)
+
+Probabilistic Checkpoint Parameters (Saturating T_hold Model):
+  mu_min_hold = 1.386 (log-mean for min hold, median = 4h)
+  mu_max_hold = 2.773 (log-mean for max hold, median = 16h)
+  w_E_hold = 10.0 (saturation width)
+  sigmaT_hold = 0.5 (lognormal std dev)
+
+Log-space Error (all doses):
+  sf_eps = 0.0001 (assay resolution floor)
+  Average |Δlog10(SF)| = 0.143569 (≈×1.39178)
