@@ -1,0 +1,422 @@
+================================================================================
+            CELL STATE TRANSITION LOGIC  (Current Implementation)
+            Source: CellStateModel.cc + CellStateModel.hh
+            Date: 2026-01-30
+================================================================================
+
+OVERVIEW
+========
+The model has two coupled subsystems:
+  1. CELL CYCLE PHASE system:  G0 -> G1 -> S -> G2 -> M -> Division
+  2. CELL STATE system:        S1 (Healthy) / S2 (Repair) / S3 (Death)
+
+Each cell has both a phase (G0/G1/S/G2/M) and a state (S1/S2/S3).
+The state determines whether the cell can progress through the cycle.
+
+
+================================================================================
+PART 1:  CELL CYCLE PHASE TRANSITIONS  (CellPhaseUpdate / CellPhaseTransition)
+================================================================================
+
+PROLIFERATION GATE (CellPhaseUpdate, line 845):
+  proliferativeFromCellState = (state == "S1")
+  --> ONLY S1 cells are allowed to cycle.
+  --> S2 and S3 cells are NON-PROLIFERATIVE (cycle is frozen).
+
+PHASE TRANSITIONS (CellPhaseTransition):
+
+  [G0] --> [G1]
+    Condition: Cell is proliferative (S1 and nutrients available)
+    Duration:  Gaussian(mTG1, sigmaTG1)
+
+  [G1] --> [S]
+    Condition: age > duration
+    Contact inhibition check: If no space -> go to G0 instead
+    Duration of S: Gaussian(mTS, sigmaTS)
+
+  [S] --> [G2]
+    Condition: age > duration
+    No contact inhibition check (committed)
+    Duration of G2: Gaussian(mTG2, sigmaTG2)
+
+  [G2] --> [M]
+    Condition: age > duration
+    Contact inhibition check: If no space -> go to G0 instead
+    Duration of M: Gaussian(mTM, sigmaTM)
+
+  [M] --> DIVISION (or MITOTIC CATASTROPHE)
+    Condition: age > duration
+    MITOTIC CATASTROPHE CHECK (lines 990-1026):
+      E3_mitotic = 0.7 * E3    (70% of normal death threshold)
+      IF Ecur >= E3_mitotic:
+        p_death = 1.0  (certain death)
+      ELSE:
+        p_death = 2 * Phi(-(|Ecur - E3_mitotic|) / (2*sigma))
+      IF random < p_death:
+        state -> S3 (dead, no division)
+        RETURN
+
+    DIVISION (lines 1028-1112):
+      IF no space available -> go to G0 (no division)
+      ELSE:
+        Mother cell is ERASED
+        Daughter 1: position = mother's position
+          phase = G0, state = S1, E = 0.0 (clean!)
+          telomere = 0.5 * mother's telomere
+          ancestry = mother's ancestry
+        Daughter 2: position = random available neighbor
+          phase = G0, state = S1, E = 0.0 (clean!)
+          telomere = 0.5 * mother's telomere
+          ancestry = mother's ancestry
+
+  [G0] (Quiescence):
+    Duration = 1E+18 (effectively infinite)
+    Returns to G1 when conditions allow
+
+
+================================================================================
+PART 2:  ENERGY UPDATE  (CellStateUpdate, lines 1121-1266)
+================================================================================
+
+At each time step (dt_h hours):
+
+  1. ENERGY INJECTION:
+     dE_inj = alpha * DSB_new + beta * integral_concentration
+     (DSB_new > 0 only on the FIRST time step after irradiation)
+
+  2. BI-EXPONENTIAL REPAIR (decay):
+     decay = f1 * exp(-lambda1 * dt_h) + f2 * exp(-lambda2 * dt_h)
+     E(t+dt) = E(t) * decay + dE_inj
+
+     Current parameters (with 0.1x repair rate scaling):
+       f1 = 0.62,  lambda1_scaled = 0.331 /h  (tau1 = 3.02h)
+       f2 = 0.38,  lambda2_scaled = 0.014 /h  (tau2 = 71.4h)
+       Effective repair time: tau_eff = 29.0 hours
+
+  3. TRANSITION TYPE SELECTION:
+     IF DSBNum > 0: transitionType = INSTANTANEOUS (use p_cum directly)
+     ELSE:          transitionType = DELAYED (scale by dt/To)
+
+  4. PHASE-DEPENDENT THRESHOLDS:
+     Each cell cycle phase modifies E2 and E3:
+       G1:  E2_G1 = E2,  E3_G1 = E3  (baseline)
+       S:   E3_S  = sqrt(E3^2 - 8*sigma^2*ln(fS))      (lower E3)
+            E2_S  = E3_S - sqrt((E3-E2)^2 - 8*sigma^2*ln(fS))
+       G2:  Same formula with fG2
+       M:   Same formula with fM
+       G0:  Treated as G1
+
+  5. DISPATCH TO STATE TRANSITION:
+     IF k_error > 1e-10:
+       -> CellStateTransitionMisrepair()  (includes misrepair channel)
+     ELSE:
+       -> CellStateTransition()           (no misrepair)
+
+  6. CHECKPOINT HOLD AGE INCREMENT:
+     IF cell is in S2 AND has checkpoint hold entry:
+       holdAge += dt_h
+
+
+================================================================================
+PART 3:  STATE TRANSITIONS  (CellStateTransitionMisrepair, lines 1534-1826)
+================================================================================
+
+This is the main transition function (used when k_error > 0).
+Two parallel functions exist: CellStateTransition (no misrepair) and
+CellStateTransitionMisrepair (with misrepair). Logic is identical for S1;
+differs for S2 where misrepair channel is added.
+
+───────────────────────────────────────────────────────────────────────────
+S1 (HEALTHY) TRANSITIONS
+───────────────────────────────────────────────────────────────────────────
+
+  Step 1: Compute base overlap probabilities (DYNAMIC, based on current Ecur)
+  ───────────────────────────────────────────────────────────────────
+    PS1->S2 = 2 * Phi(-(|Ecur - E2|) / (2*sigma))
+    PS1->S3 = 2 * Phi(-(|Ecur - E3|) / (2*sigma))
+
+    NOTE: These are recomputed EACH TIME STEP as Ecur changes.
+    As damage decays: PS1->S2 decreases, PS1->S3 decreases.
+
+  Step 2: Soft saturation
+  ──────────────────────
+    IF Ecur >= E3 + 0*sigma = E3:  PS1->S3 = 1.0  (hard saturation)
+
+  Step 3: Convert to per-step probability
+  ────────────────────────────────────────
+    INSTANTANEOUS (first step, DSBs > 0):
+      p12_step = PS1->S2        (full cumulative probability applied once)
+      p13_step = PS1->S3
+
+    DELAYED (subsequent steps, no new DSBs):
+      p12_step = 1 - (1 - PS1->S2)^(dt/To12)     To12 = T_cellCycle = 10h
+      p13_step = 1 - (1 - PS1->S3)^(dt/To13)     To13 = T_cellCycle = 10h
+
+  Step 4: CHECKPOINT MODIFICATION (if checkpointEnabled)
+  ──────────────────────────────────────────────────────
+    E_hold = E3 - k_hold * sigma = E3 - 1.5*sigma
+    pi(E) = 1 / (1 + exp(-(Ecur - E_hold) / w_hold))    [engagement prob]
+
+    Modified probabilities (eta = 1.0):
+      p13_step' = (1 - eta * pi(E)) * p13_step    [reduced direct death]
+      p12_step' = p12_step + eta * pi(E) * p13_step  [diverted to repair]
+
+    Effect: At high damage near E3, death probability is diverted to S2.
+    At Ecur = E_hold: ~50% of S1->S3 transitions become S1->S2.
+    At Ecur >> E_hold: nearly all S1->S3 transitions become S1->S2.
+
+  Step 5: Competing random draw
+  ─────────────────────────────
+    Normalize: if (p12 + p13) > 1 -> rescale proportionally
+    Draw u ~ Uniform(0,1):
+      IF u < p13:              -> S3 (DEATH)
+      ELSE IF u < p13 + p12:   -> S2 (REPAIR)
+        IF checkpoint engaged (u_ckpt < pi(E)):
+          Sample T_hold ~ LogNormal(mu_E, sigmaT_hold)
+            where median scales with T_cycle (0.4 to 1.0 * T_cycle)
+            clamped to [0.1*T_cycle, 1.5*T_cycle]
+          Initialize holdAge = 0
+        ELSE:
+          Enter S2 without checkpoint hold
+      ELSE:                    stay S1, age += dt
+
+───────────────────────────────────────────────────────────────────────────
+S2 (REPAIR) TRANSITIONS  --  with MISREPAIR channel
+───────────────────────────────────────────────────────────────────────────
+
+  Step 1: Compute base overlap probabilities (DYNAMIC)
+  ────────────────────────────────────────────────────
+    PS2->S1 = 2 * Phi(-(|Ecur - E1|) / (2*sigma))    [recovery]
+    PS2->S3 = 2 * Phi(-(|Ecur - E3|) / (2*sigma))    [catastrophe]
+
+    NOTE: As Ecur decays toward 0 (E1):
+      PS2->S1 INCREASES (recovery becomes more likely)
+      PS2->S3 DECREASES (catastrophe becomes less likely)
+
+  Step 2: Soft saturation
+  ──────────────────────
+    IF Ecur >= E3:  PS2->S3 = 1.0
+
+  Step 3: Convert to per-step probability
+  ────────────────────────────────────────
+    p21_step = per-step recovery probability      (using To21)
+    p23_energy_step = per-step catastrophe prob    (using To23)
+
+    CRITICAL: To21 and To23 are currently set to effective_repair_time = 29h
+    in test_calibration_validation.cc, BUT the calibration model uses
+    T21 = T23 = 10h. This 3x mismatch slows all S2 transitions.
+
+  Step 4: CHECKPOINT GATING (if in checkpoint hold)
+  ─────────────────────────────────────────────────
+    IF cell has checkpoint hold AND holdAge < T_hold:
+      g(t) = (holdAge / T_hold)^q_gate        (q_gate = 1.5)
+      p23_cat_step = g(t) * p23_energy_step
+
+      When holdAge = 0:     g = 0   (catastrophe fully suppressed)
+      When holdAge = T_hold: g = 1   (catastrophe fully released)
+
+    IF cell has no checkpoint, or holdAge >= T_hold:
+      p23_cat_step = p23_energy_step  (no gating)
+
+  Step 5: MISREPAIR ON RECOVERY ATTEMPT (Version 2)
+  ─────────────────────────────────────────────────
+    k_error_energy = k_error_dsb / alpha        (convert to energy units)
+    lambda_mis = k_error_energy * Ecur          (hazard rate)
+    p_mis = 1 - exp(-lambda_mis * dt)           (misrepair probability)
+
+    Misrepair death:       p23_mis = p21_step * p_mis
+    Successful recovery:   p21_eff = p21_step * (1 - p_mis)
+
+    Total death = catastrophe + misrepair:
+      p23_total = p23_cat_step + p23_mis
+
+    KEY: Misrepair ONLY fires when cell ATTEMPTS recovery (S2->S1).
+    It does NOT fire as a background hazard while cell sits in S2.
+
+  Step 6: Competing random draw
+  ─────────────────────────────
+    Normalize: if (p21_eff + p23_total) > 1 -> rescale
+    Draw u ~ Uniform(0,1):
+      IF u < p23_total:           -> S3 (DEATH via catastrophe OR misrepair)
+      ELSE IF u < p23 + p21_eff:  -> S1 (SUCCESSFUL RECOVERY)
+      ELSE:                       stay S2, age += dt
+
+    On any S2 exit (to S1 or S3): checkpoint tracking is erased.
+
+───────────────────────────────────────────────────────────────────────────
+S3 (DEATH) -- ABSORBING STATE
+───────────────────────────────────────────────────────────────────────────
+  age += dt  (no transitions out)
+
+
+================================================================================
+PART 4:  IDENTIFIED MISMATCHES WITH ANALYTICAL CALIBRATION MODEL
+================================================================================
+
+The analytical calibration model (RepairMediatedModel_with_k_error.cc)
+computes survival as:
+
+  SF = Sum_n P(n DSBs) * [P1(n) + P2(n) * R21(n)]
+
+Where:
+  P1, P2, P3 = state assignment probs (overlap at INITIAL energy = alpha*n)
+  lambda21 = -log(1 - overlap(e2, 0)) / T21         T21 = 10h
+  lambda23 = -log(1 - overlap(e2, e3)) / T23 + k_error * n   T23 = 10h
+  R21 = (lambda21 / lambda_sum) * (1 - exp(-lambda_sum * T_assay))
+
+MISMATCHES:
+
+  1. TIMESCALE MISMATCH (HIGHEST IMPACT):
+     Calibration: T21 = T23 = 10h (cell cycle time)
+     Simulation:  To21 = To23 = 29h (effective repair time)
+     Effect: All S2 transitions are ~3x slower per step in simulation.
+     Combined with energy decay, this strongly favors recovery over death.
+
+  2. STATIC vs DYNAMIC ENERGY:
+     Calibration: Overlap computed at FIXED e2 threshold (constant rates)
+     Simulation:  Overlap computed at CURRENT Ecur (changes every step)
+     Effect: As Ecur decays toward 0, recovery probability increases
+     continuously. The analytical model uses constant competing rates.
+
+  3. CHECKPOINT (NOT IN CALIBRATION):
+     Calibration: No checkpoint mechanism at all
+     Simulation:  Checkpoint diverts S1->S3 to S1->S2 (eta=1.0),
+                  gates S2->S3 catastrophe during hold,
+                  pauses cell cycle (no mitotic catastrophe during hold)
+     Effect: Pure added protection not accounted for in calibrated params.
+
+  4. CELL PROLIFERATION (NOT IN CALIBRATION):
+     Calibration: Computes S1 fraction at assay time (no division)
+     Simulation:  Cells in S1 can divide, creating daughters with E=0.
+                  Colony assay counts ancestry groups with >= 4 S1 cells.
+     Effect: One successful division can create a surviving colony
+     even if most cells in the lineage are dead.
+
+  5. MISREPAIR MODEL MISMATCH:
+     Calibration: lambda23_tot = lambda23_energy + k_error * n_DSB
+                  (additive to catastrophe rate, constant hazard)
+     Simulation:  p23_mis = p21 * p_mis (tied to recovery attempts only)
+                  (fires only when cell tries S2->S1)
+     Effect: Different functional form, but k_error is tiny (0.001)
+     so this mismatch is minor.
+
+
+================================================================================
+PART 5:  CURRENT PARAMETER VALUES
+================================================================================
+
+Cell State Parameters (from calibration):
+  E1 = 0.0          E2 = 36.23       E3 = 69.49
+  sigma = 10.0      alpha = 0.529    kappa = 40 DSB/Gy
+  k_error = 0.001 per (DSB*hour) [enforced minimum]
+
+Observation Windows (IN SIMULATION -- MISMATCH WITH CALIBRATION):
+  To12 = T_cellCycle = 10.0h    (S1->S2)
+  To13 = T_cellCycle = 10.0h    (S1->S3)
+  To21 = effective_repair_time = 29.0h    (S2->S1) ** should be 10h **
+  To23 = effective_repair_time = 29.0h    (S2->S3) ** should be 10h **
+
+Checkpoint Parameters:
+  k_hold = 1.5         E_hold = E3 - 1.5*sigma = 54.49
+  w_hold = 8.0         eta = 1.0 (full diversion)
+  q_gate = 1.5         sigmaT_hold = 0.5
+
+Hold Duration (cycle-scaled):
+  holdMedianMinCycleFraction = 0.4   (median_min = 4h for T_cycle=10h)
+  holdMedianMaxCycleFraction = 1.0   (median_max = 10h for T_cycle=10h)
+  holdClampMinCycleFraction  = 0.1   (clamp_min = 1h)
+  holdClampMaxCycleFraction  = 1.5   (clamp_max = 15h)
+
+Repair (0.1x scaled):
+  lambda1 = 0.331/h (tau = 3.02h)
+  lambda2 = 0.014/h (tau = 71.4h)
+  f1 = 0.62, f2 = 0.38
+
+Soft Saturation:
+  margin = 0.0  (hard saturation at E3)
+
+Cell Cycle:
+  T_cellCycle = tG1+tS+tG2+tM = 1.5+6.0+1.5+1.0 = 10.0h
+  Only S1 cells can cycle (S2 and S3 are frozen)
+
+Colony Assay:
+  colonySizeThreshold = 4  (need >= 4 S1 descendants)
+  Total cells = 1000
+  Simulation time = 27.8h (~10000 steps * 10s)
+
+
+================================================================================
+PART 6:  FLOW DIAGRAM
+================================================================================
+
+                         RADIATION
+                            |
+                     ΔE = alpha * DSB
+                            |
+                            v
+                    ┌───────────────┐
+                    |      S1       |<──────────────────────────────┐
+                    |   (Healthy)   |                               |
+                    | Ecur = E*decay|                               |
+                    |    + ΔE_inj   |                               |
+                    └───┬───────┬───┘                               |
+                        |       |                                   |
+              p13_step  |       |  p12_step                         |
+           (may be      |       |  (boosted by                     |
+            diverted    |       |   checkpoint                     |
+            by ckpt)    |       |   diversion)                     |
+                        v       v                                   |
+                   ┌────────┐  ┌────────────────────┐               |
+                   |   S3   |  |        S2          |               |
+                   | (Dead) |  |     (Repair)       |               |
+                   |        |  |                    |               |
+                   |absorb- |  | Checkpoint hold:   |               |
+                   |  ing   |  |  cycle FROZEN      |               |
+                   |        |  |  catastrophe GATED |               |
+                   └────────┘  |                    |               |
+                       ^       | Two exit paths:    |               |
+                       |       |                    |               |
+                       |       | PATH A: Catastrophe|               |
+                       |       |  p23_cat = g(t)*P  |               |
+                       |<──────|  (energy-based)    |               |
+                       |       |                    |               |
+                       |       | PATH B: Misrepair  |               |
+                       |       |  p23_mis = p21*p_m |               |
+                       |<──────|  (on recovery try) |               |
+                       |       |                    |               |
+                       |       | PATH C: Recovery   |               |
+                       |       |  p21_eff = p21*    |               |
+                       |       |    (1-p_mis)       |───────────────┘
+                       |       └────────────────────┘
+                       |
+                  Also from M phase:
+                  MITOTIC CATASTROPHE
+                  (if Ecur > 0.7*E3)
+
+
+================================================================================
+PART 7:  CELL DIVISION DETAIL
+================================================================================
+
+When an S1 cell completes M phase:
+
+  1. Mitotic catastrophe check (threshold = 0.7*E3)
+     -> If fails: state = S3, no division
+
+  2. Space check (contact inhibition)
+     -> If no space: phase = G0, wait
+
+  3. Division:
+     Mother ERASED from all maps
+     Daughter1: pos=mother, phase=G0, state=S1, E=0.0, tel=0.5*mother
+     Daughter2: pos=neighbor, phase=G0, state=S1, E=0.0, tel=0.5*mother
+     Both daughters inherit mother's ancestryID (for colony counting)
+
+  KEY: Daughters start with E=0 (zero damage, healthy).
+  This means ANY cell reaching division creates "clean" progeny
+  that will never transition to S2 or S3 (unless re-irradiated).
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
