@@ -1,0 +1,342 @@
+================================================================================
+     CELL STATE TRANSITION LOGIC (UPDATED - Probabilistic Checkpoint Only)
+================================================================================
+
+After modification: Only the PROBABILISTIC CHECKPOINT design is retained.
+The CHECKPOINT_ORIGINAL and CHECKPOINT_S2S3_ONLY modes have been removed.
+
+================================================================================
+                              MODEL OVERVIEW
+================================================================================
+
+Cell States:
+  - S1: Healthy (proliferative, clonogenic)
+  - S2: Repair (non-proliferative, may recover or die)
+  - S3: Death (absorbing state, non-clonogenic)
+
+Key Parameters (from CellStateModel.hh):
+  - checkpointEnabled = true (default)
+  - softSaturationEnabled = true (default)
+  - softSaturationMargin = 1.0 (E3 + 1*sigma threshold)
+
+Probabilistic Checkpoint Parameters:
+  - k_hold = 1.5          (E_hold = E3 - k_hold*sigma)
+  - w_hold = 8.0          (width for logistic engagement probability)
+  - eta = 1.0             (diversion strength, 100% diversion)
+  - mu_min_hold = 1.386   (ln(4h) -> median min hold = 4 hours)
+  - mu_max_hold = 2.773   (ln(16h) -> median max hold = 16 hours)
+  - w_E_hold = 10.0       (width for saturating log-mean)
+  - sigmaT_hold = 0.5     (lognormal std dev for hold duration)
+  - q_gate = 1.5          (power for gating function)
+
+================================================================================
+                         S1 TRANSITIONS (HEALTHY STATE)
+================================================================================
+
+                              ┌─────────────────┐
+                              │   S1 (Healthy)  │
+                              │    E_cur = E    │
+                              └────────┬────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+              ┌───────────┐     ┌───────────┐     ┌───────────┐
+              │  Stay S1  │     │ S1 → S2   │     │ S1 → S3   │
+              │ (no trans)│     │ (repair)  │     │ (death)   │
+              └───────────┘     └───────────┘     └───────────┘
+
+Step 1: Calculate Base Transition Probabilities
+───────────────────────────────────────────────
+  ES1→S2 = -|E_cur - E2| / (2σ)
+  PS1→S2 = 2 × Φ(ES1→S2)        [Φ = standard normal CDF]
+
+  ES1→S3 = -|E_cur - E3| / (2σ)
+  PS1→S3 = 2 × Φ(ES1→S3)
+
+Step 2: Apply Soft Saturation (if enabled)
+──────────────────────────────────────────
+  IF softSaturationEnabled:
+      IF E_cur >= E3 + softSaturationMargin × σ:
+          PS1→S3 = 1.0    [Guaranteed death]
+  ELSE (hard saturation):
+      IF E_cur >= E3:
+          PS1→S3 = 1.0
+
+Step 3: Convert to Per-Step Probabilities
+─────────────────────────────────────────
+  IF instantaneous transition (DSB > 0):
+      p12_step = InstantaneousStateJumpProb(PS1→S2, dt, To12)
+      p13_step = InstantaneousStateJumpProb(PS1→S3, dt, To13)
+  ELSE (delayed transition):
+      p12_step = DelayedStateJumpProb(PS1→S2, dt, To12)
+      p13_step = DelayedStateJumpProb(PS1→S3, dt, To13)
+
+Step 4: Apply Probabilistic Checkpoint (if enabled)
+───────────────────────────────────────────────────
+  IF checkpointEnabled:
+      E_hold = E3 - k_hold × σ
+      
+      π(E) = 1 / (1 + exp(-(E_cur - E_hold) / w_hold))   [Checkpoint engagement prob]
+      
+      # Marginalization: divert death probability to repair
+      p13_step_new = (1 - η × π(E)) × p13_step
+      p12_step_new = p12_step + η × π(E) × p13_step
+      
+      # Clamp to [0, 1]
+      p12_step = clamp(p12_step_new, 0, 1)
+      p13_step = clamp(p13_step_new, 0, 1)
+
+Step 5: Normalize Probabilities
+───────────────────────────────
+  IF p12_step + p13_step > 1:
+      p12_step = p12_step / (p12_step + p13_step)
+      p13_step = p13_step / (p12_step + p13_step)
+
+Step 6: Stochastic Transition
+─────────────────────────────
+  u = UniformRandom(0, 1)
+  
+  IF u < p13_step:
+      state = S3 (DEATH)
+      Clear checkpoint tracking
+      
+  ELSE IF u < p13_step + p12_step:
+      state = S2 (REPAIR)
+      
+      # Determine checkpoint engagement for this cell
+      IF checkpointEnabled:
+          u_checkpoint = UniformRandom(0, 1)
+          IF u_checkpoint < π(E):
+              # CHECKPOINT ENGAGED
+              s(E) = SaturatingLogMean(E_cur, E_hold, w_E_hold)
+              μ_E = μ_min_hold + (μ_max_hold - μ_min_hold) × s(E)
+              T_hold = SampleLogNormal(μ_E, σ_T_hold)
+              
+              Store: cellT_hold_h[cellID] = T_hold
+              Store: cellCheckpointEngaged[cellID] = true
+              Store: cellS2HoldAge_h[cellID] = 0.0
+          ELSE:
+              # NO CHECKPOINT
+              Store: cellCheckpointEngaged[cellID] = false
+              
+  ELSE:
+      state = S1 (STAY HEALTHY)
+      age += dt
+
+
+================================================================================
+                S2 TRANSITIONS (REPAIR STATE - NO MISREPAIR)
+================================================================================
+
+                              ┌─────────────────┐
+                              │   S2 (Repair)   │
+                              │    E_cur = E    │
+                              └────────┬────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+              ┌───────────┐     ┌───────────┐     ┌───────────┐
+              │  Stay S2  │     │ S2 → S1   │     │ S2 → S3   │
+              │ (no trans)│     │ (recover) │     │ (death)   │
+              └───────────┘     └───────────┘     └───────────┘
+
+Step 1: Calculate Base Transition Probabilities
+───────────────────────────────────────────────
+  ES2→S1 = -|E_cur - E1| / (2σ)    [E1 = 0]
+  PS2→S1 = 2 × Φ(ES2→S1)
+
+  ES2→S3 = -|E_cur - E3| / (2σ)
+  PS2→S3 = 2 × Φ(ES2→S3)
+
+Step 2: Apply Soft Saturation
+─────────────────────────────
+  IF softSaturationEnabled:
+      IF E_cur >= E3 + softSaturationMargin × σ:
+          PS2→S3 = 1.0
+  ELSE:
+      IF E_cur >= E3:
+          PS2→S3 = 1.0
+
+Step 3: Convert to Per-Step Probabilities
+─────────────────────────────────────────
+  p21_step = ...StateJumpProb(PS2→S1, dt, To21)
+  p23_0_step = ...StateJumpProb(PS2→S3, dt, To23)
+
+Step 4: Apply Probabilistic Checkpoint Gating (if in checkpoint)
+────────────────────────────────────────────────────────────────
+  p23_step = p23_0_step
+  
+  IF checkpointEnabled AND cellCheckpointEngaged[cellID] == true:
+      t = cellS2HoldAge_h[cellID]    # Current hold age
+      T_hold = cellT_hold_h[cellID]  # Sampled hold duration
+      
+      g(t) = (t / T_hold)^q_gate     # Gating function [0 → 1]
+      g(t) = min(g(t), 1.0)          # Clamp at 1
+      
+      p23_step = g(t) × p23_0_step   # GATE death probability
+      
+      # When t << T_hold: g(t) ≈ 0 → death blocked
+      # When t >= T_hold: g(t) = 1 → death allowed
+
+Step 5: Normalize and Execute Transition
+────────────────────────────────────────
+  [Same as S1: normalize, random draw, transition]
+  
+  IF transition to S1 or S3:
+      Clear checkpoint tracking for this cell
+
+
+================================================================================
+          S2 TRANSITIONS WITH MISREPAIR (CellStateTransitionMisrepair)
+================================================================================
+
+Same as above, but with additional MISREPAIR death channel:
+
+Step 4b: Calculate Misrepair Death Probability
+──────────────────────────────────────────────
+  k_error_energy = k_error_dsb / alpha    # Convert units
+  λ_mis = k_error_energy × E_cur          # Misrepair hazard rate
+  p23_mis_step = 1 - exp(-λ_mis × dt)     # Misrepair death prob
+
+Step 4c: Combine Death Channels
+───────────────────────────────
+  # Death can occur via EITHER catastrophe OR misrepair
+  p23_step = 1 - (1 - p23_cat_step) × (1 - p23_mis_step)
+  
+  Where:
+    p23_cat_step = energy-based death (gated by checkpoint)
+    p23_mis_step = misrepair-based death (NOT gated)
+
+
+================================================================================
+                         S3 TRANSITIONS (DEATH STATE)
+================================================================================
+
+  S3 is an ABSORBING STATE - no transitions out
+  
+  Cell remains in S3, age increments:
+      age += dt
+
+
+================================================================================
+                    PROBABILISTIC CHECKPOINT FUNCTIONS
+================================================================================
+
+1. Checkpoint Engagement Probability: π(E)
+──────────────────────────────────────────
+   π(E) = 1 / (1 + exp(-(E - E_hold) / w))
+   
+   Where:
+     E_hold = E3 - k_hold × σ
+     w = w_hold (default 8.0)
+   
+   Behavior:
+     E << E_hold: π(E) ≈ 0 (low damage, no checkpoint)
+     E = E_hold:  π(E) = 0.5
+     E >> E_hold: π(E) ≈ 1 (high damage, checkpoint engaged)
+
+2. Saturating Log-Mean: s(E)
+────────────────────────────
+   s(E) = 1 / (1 + exp(-(E - E_hold) / w_E_hold))
+   
+   Maps damage level to [0, 1] for interpolating hold duration
+
+3. Hold Duration Sampling
+─────────────────────────
+   μ(E) = μ_min + (μ_max - μ_min) × s(E)
+   T_hold ~ LogNormal(μ(E), σ_T)
+   
+   Low damage:  μ ≈ μ_min = 1.386 → median 4 hours
+   High damage: μ ≈ μ_max = 2.773 → median 16 hours
+
+4. Gating Function: g(t, T_hold)
+────────────────────────────────
+   g(t) = min((t / T_hold)^q, 1.0)
+   
+   Where q = q_gate (default 1.5)
+   
+   Behavior:
+     t = 0:      g = 0 (death fully blocked)
+     t = T_hold: g = 1 (death fully allowed)
+     0 < t < T:  g gradually increases (death gradually allowed)
+
+
+================================================================================
+                              DEFAULT PARAMETERS
+================================================================================
+
+Calibrated Model Parameters (example from last run):
+  E1 = 0.0
+  E2 = 36.23
+  E3 = 69.49
+  σ  = 10.0
+  α  = 0.529 (energy per DSB)
+
+Checkpoint Parameters:
+  E_hold = E3 - k_hold × σ = 69.49 - 1.5 × 10 = 54.49
+
+Soft Saturation Threshold:
+  E3 + margin × σ = 69.49 + 1.0 × 10 = 79.49
+  (Guaranteed death if E_cur >= 79.49)
+
+
+================================================================================
+                              SUMMARY DIAGRAM
+================================================================================
+
+                    ┌─────────────────────────────────────────────────┐
+                    │                  CELL LIFECYCLE                 │
+                    └─────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+                              ┌───────────────────────┐
+                              │   S1 (HEALTHY)        │
+                              │   Proliferative       │
+                              │   Clonogenic          │
+                              └───────────┬───────────┘
+                                          │
+                         ┌────────────────┴────────────────┐
+                         │                                 │
+            p12_step (+ checkpoint diversion)      p13_step (- checkpoint diversion)
+                         │                                 │
+                         ▼                                 ▼
+              ┌───────────────────────┐         ┌───────────────────────┐
+              │   S2 (REPAIR)         │         │   S3 (DEATH)          │
+              │   Non-proliferative   │         │   Absorbing state     │
+              │   May be in checkpoint│         │   Non-clonogenic      │
+              └───────────┬───────────┘         └───────────────────────┘
+                          │                                 ▲
+         ┌────────────────┴────────────────┐               │
+         │                                 │               │
+    p21_step (repair)              p23_step (death)        │
+         │                        (gated if checkpoint)    │
+         │                                 │               │
+         ▼                                 └───────────────┘
+    ┌───────────────────────┐
+    │   Back to S1          │
+    │   (RECOVERED)         │
+    └───────────────────────┘
+
+
+================================================================================
+                         KEY CHANGES FROM PREVIOUS VERSION
+================================================================================
+
+REMOVED:
+  - CHECKPOINT_ORIGINAL mode (G2→M checkpoint + S1→S2 initiation)
+  - CHECKPOINT_S2S3_ONLY mode (blocking S2→S3 when PS2→S1 < PS2→S3)
+  - SetCheckpointDesignMode() / GetCheckpointDesignMode() functions
+  - k_checkpoint parameter (phase-specific threshold)
+  - T_hold_h fixed hold time parameter
+
+RETAINED (Probabilistic Checkpoint Design):
+  - Stochastic checkpoint engagement based on damage level
+  - Heterogeneous hold durations (lognormal sampling)
+  - Gradual gating of death probability during hold
+  - Diversion of death probability to repair (marginalization)
+
+================================================================================
+
+

@@ -572,7 +572,7 @@ int main(int argc, char** argv)
         // Calculate survival fraction
         double survivalFraction = (double)colonyNumber / cellNum;
         
-        // Store SF results (thread-safe since each thread writes to different index)
+        // Store SF results (thread-saf     e since each thread writes to different index)
         cellSF_results[n].dose = dose;
         cellSF_results[n].colonyNumber = colonyNumber;
         cellSF_results[n].sf = survivalFraction;

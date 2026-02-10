@@ -16,6 +16,11 @@ inline double UniformRand() {
     return uniformRand(gen);
 }
 
+void CellLayoutInitializer::SetRandomSeed(unsigned long long seed)
+{
+    gen.seed(static_cast<std::mt19937::result_type>(seed));
+}
+
 CellLayoutInitializer::CellLayoutInitializer()
 {
     cellHomeSizeX=1;

@@ -1,0 +1,546 @@
+================================================================================
+CELL STATE TRANSITION DECISION LOGIC - FROM CellStateModel.cc
+================================================================================
+Extracted directly from the source code implementation
+
+================================================================================
+FUNCTION: CellStateUpdate() [Lines 1122-1291]
+================================================================================
+Entry point for state updates each time step
+
+                    ┌─────────────────────────────────────────┐
+                    │   CellStateUpdate(cellID, DSBNum,       │
+                    │                   integralConcentration,│
+                    │                   deltaT, frequency)    │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   GUARD CHECK: Cell exists?             │
+                    │                                         │
+                    │   IF cellTypeMap.find(cellID) == end()  │
+                    │      OR cellPhaseMap.find() == end()    │
+                    │      OR cellStateMap.find() == end()    │
+                    │   THEN: return (do nothing)             │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CONVERT TIME UNITS                    │
+                    │                                         │
+                    │   increaseTime = deltaT × frequency     │
+                    │                    / 3600.0   [hours]   │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CALCULATE EXTERNAL PERTURBATION       │
+                    │                                         │
+                    │   dE = α × DSBNum + β × integralConc    │
+                    │                                         │
+                    │   cellExternalPerturbationEnergyMap     │
+                    │   [cellID] = dE                         │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   BI-EXPONENTIAL REPAIR DECAY           │
+                    │                                         │
+                    │   decay = f1 × exp(-λ1 × dt_h)          │
+                    │         + f2 × exp(-λ2 × dt_h)          │
+                    │                                         │
+                    │   E_new = E_old × decay + dE_injected   │
+                    │                                         │
+                    │   (st.E = st.E * decay + dEinj)         │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   DETERMINE TRANSITION TYPE             │
+                    │                                         │
+                    │   transitionType = (DSBNum > 0)         │
+                    │   - true = instantaneous (new damage)   │
+                    │   - false = delayed (ongoing repair)    │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CHECK MISREPAIR MODE                  │
+                    │                                         │
+                    │   useMisrepair = (k_error > 1e-10)      │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   DISPATCH BY CELL PHASE                │
+                    │                                         │
+                    │   Phase-specific thresholds:            │
+                    │   E3_phase = √(E3² - 8σ²ln(f_phase))    │
+                    │   E2_phase = E3_phase -                 │
+                    │       √((E3-E2)² - 8σ²ln(f_phase))      │
+                    └─────────────────────────────────────────┘
+                                       │
+         ┌─────────────┬───────────────┼───────────────┬─────────────┐
+         │             │               │               │             │
+         ▼             ▼               ▼               ▼             ▼
+    ┌────────┐    ┌────────┐     ┌────────┐     ┌────────┐    ┌────────┐
+    │  G1    │    │   S    │     │  G2    │     │   M    │    │  G0    │
+    │        │    │        │     │        │     │        │    │        │
+    │ E1=0   │    │ E1_S=0 │     │ E1_G2=0│     │ E1_M=0 │    │ E1=0   │
+    │ E2     │    │ E2_S   │     │ E2_G2  │     │ E2_M   │    │ E2     │
+    │ E3     │    │ E3_S   │     │ E3_G2  │     │ E3_M   │    │ E3     │
+    │fG1=1.0 │    │fS=0.816│     │fG2=1.02│     │fM=1.02 │    │        │
+    └────────┘    └────────┘     └────────┘     └────────┘    └────────┘
+         │             │               │               │             │
+         └─────────────┴───────────────┴───────────────┴─────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CALL TRANSITION FUNCTION              │
+                    │                                         │
+                    │   IF useMisrepair:                      │
+                    │      CellStateTransitionMisrepair(...)  │
+                    │   ELSE:                                 │
+                    │      CellStateTransition(...)           │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+FUNCTION: CellStateTransition() [Lines 1294-1552]
+================================================================================
+Standard state transition (without misrepair)
+
+                    ┌─────────────────────────────────────────┐
+                    │   CellStateTransition(cellID,           │
+                    │                       E1, E2, E3,       │
+                    │                       sigma,            │
+                    │                       increaseTime,     │
+                    │                       transitionType)   │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   GUARD: Cell exists in cellStateMap?   │
+                    │   IF NOT: return                        │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   GET CURRENT STATE                     │
+                    │   st = cellStateMap[cellID]             │
+                    └─────────────────────────────────────────┘
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         │                             │                             │
+         ▼                             ▼                             ▼
+    ┌──────────┐                 ┌──────────┐                 ┌──────────┐
+    │ st.state │                 │ st.state │                 │ st.state │
+    │   == S1  │                 │   == S2  │                 │   == S3  │
+    └──────────┘                 └──────────┘                 └──────────┘
+         │                             │                             │
+         ▼                             ▼                             ▼
+    S1 TRANSITIONS              S2 TRANSITIONS              S3 TRANSITIONS
+    (see below)                 (see below)                 (absorbing)
+
+================================================================================
+S1 STATE TRANSITIONS [Lines 1326-1430]
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STATE: S1 (Healthy)                   │
+                    │   E_cur = st.E (current energy)         │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CALCULATE OVERLAP PROBABILITIES       │
+                    │                                         │
+                    │   ES1→S2 = -|E_cur - E2| / (2σ)         │
+                    │   PS1→S2 = 2 × Φ(ES1→S2, 0, 1)          │
+                    │                                         │
+                    │   ES1→S3 = -|E_cur - E3| / (2σ)         │
+                    │   PS1→S3 = 2 × Φ(ES1→S3, 0, 1)          │
+                    │                                         │
+                    │   where Φ = Gaussian CDF                │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   SOFT SATURATION CHECK                 │
+                    │                                         │
+                    │   IF softSaturationEnabled:             │
+                    │      IF E_cur >= E3 + margin×σ:        │
+                    │         PS1→S3 = 1.0                    │
+                    │         (margin = 1.0 by default)       │
+                    │   ELSE (hard saturation):               │
+                    │      IF E_cur >= E3:                    │
+                    │         PS1→S3 = 1.0                    │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CONVERT TO PER-STEP PROBABILITIES     │
+                    │                                         │
+                    │   IF transitionType (instantaneous):    │
+                    │      p12 = InstantaneousJumpProb(       │
+                    │              PS1→S2, dt, To12)          │
+                    │      p13 = InstantaneousJumpProb(       │
+                    │              PS1→S3, dt, To13)          │
+                    │                                         │
+                    │   ELSE (delayed):                       │
+                    │      p12 = DelayedJumpProb(             │
+                    │              PS1→S2, dt, To12)          │
+                    │      p13 = DelayedJumpProb(             │
+                    │              PS1→S3, dt, To13)          │
+                    │                                         │
+                    │   InstantaneousJumpProb: p = p_sp       │
+                    │   DelayedJumpProb:                      │
+                    │      p = 1 - (1-p_sp)^(dt/To)           │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   PROBABILISTIC CHECKPOINT              │
+                    │   (if CHECKPOINT_PROBABILISTIC mode)    │
+                    │                                         │
+                    │   E_hold = E3 - k_hold × σ              │
+                    │   π(E) = 1/(1+exp(-(E-E_hold)/w_hold))  │
+                    │                                         │
+                    │   p13_new = (1 - η×π) × p13_0           │
+                    │   p12_new = p12_0 + η×π × p13_0         │
+                    │                                         │
+                    │   (Redirects death to repair)           │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   NORMALIZE PROBABILITIES               │
+                    │                                         │
+                    │   pSum = p12 + p13                      │
+                    │   IF pSum > 1.0:                        │
+                    │      p12 /= pSum                        │
+                    │      p13 /= pSum                        │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   RANDOM TRANSITION DECISION            │
+                    │                                         │
+                    │   u = UniformRand()  [0, 1)             │
+                    └─────────────────────────────────────────┘
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         │                             │                             │
+         ▼                             ▼                             ▼
+    ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+    │ u < p13      │          │ u < p13+p12  │          │ ELSE         │
+    │              │          │              │          │              │
+    │ st.state="S3"│          │ st.state="S2"│          │ st.age += dt │
+    │              │          │              │          │              │
+    │ → DEATH      │          │ → REPAIR     │          │ → STAY S1    │
+    │ (absorbing)  │          │   STATE      │          │              │
+    │              │          │              │          │              │
+    │ Clean up     │          │ IF PROB_CHKPT│          │              │
+    │ checkpoint   │          │ engaged:     │          │              │
+    │ tracking     │          │   sample     │          │              │
+    │              │          │   T_hold     │          │              │
+    └──────────────┘          └──────────────┘          └──────────────┘
+
+================================================================================
+S2 STATE TRANSITIONS [Lines 1435-1539]
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STATE: S2 (Repair)                    │
+                    │   E_cur = st.E (current energy)         │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CALCULATE OVERLAP PROBABILITIES       │
+                    │                                         │
+                    │   ES2→S1 = -|E_cur - E1| / (2σ)         │
+                    │   PS2→S1 = 2 × Φ(ES2→S1, 0, 1)          │
+                    │         = 2 × Φ(-|E_cur| / 2σ)          │
+                    │   (note: E1 = 0)                        │
+                    │                                         │
+                    │   ES2→S3 = -|E_cur - E3| / (2σ)         │
+                    │   PS2→S3 = 2 × Φ(ES2→S3, 0, 1)          │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   SOFT SATURATION CHECK                 │
+                    │                                         │
+                    │   IF softSaturationEnabled:             │
+                    │      IF E_cur >= E3 + margin×σ:        │
+                    │         PS2→S3 = 1.0 (certain death)    │
+                    │         (margin = 1.0 by default)       │
+                    │   ELSE:                                 │
+                    │      IF E_cur >= E3:                    │
+                    │         PS2→S3 = 1.0                    │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CHECKPOINT HOLD CHECK                 │
+                    │   (CHECKPOINT_S2S3_ONLY mode)           │
+                    │                                         │
+                    │   IF PS2→S1 < PS2→S3:                   │
+                    │      (death more likely than repair)    │
+                    │      Start checkpoint hold:             │
+                    │      cellS2HoldAge_h[cellID] = 0.0      │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CALCULATE PER-STEP PROBABILITIES      │
+                    │                                         │
+                    │   p21 = JumpProb(PS2→S1, dt, To21)      │
+                    │   p23_0 = JumpProb(PS2→S3, dt, To23)    │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CHECKPOINT GATING                     │
+                    │                                         │
+                    │   IF CHECKPOINT_PROBABILISTIC:          │
+                    │      IF checkpoint engaged:             │
+                    │         t = hold age                    │
+                    │         T_hold = sampled duration       │
+                    │         g(t) = (t/T_hold)^q             │
+                    │         p23 = g(t) × p23_0              │
+                    │                                         │
+                    │   ELIF CHECKPOINT_ORIGINAL:             │
+                    │      IF cellS2HoldAge_h[cellID]         │
+                    │         < T_hold_h (6.0 hours):         │
+                    │         p23 = 0.0 (BLOCKED)             │
+                    │                                         │
+                    │   ELSE:                                 │
+                    │      p23 = p23_0 (no gating)            │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   NORMALIZE PROBABILITIES               │
+                    │                                         │
+                    │   pSum = p21 + p23                      │
+                    │   IF pSum > 1.0:                        │
+                    │      p21 /= pSum                        │
+                    │      p23 /= pSum                        │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   RANDOM TRANSITION DECISION            │
+                    │                                         │
+                    │   u = UniformRand()                     │
+                    └─────────────────────────────────────────┘
+                                       │
+         ┌─────────────────────────────┼─────────────────────────────┐
+         │                             │                             │
+         ▼                             ▼                             ▼
+    ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
+    │ u < p23      │          │ u < p23+p21  │          │ ELSE         │
+    │              │          │              │          │              │
+    │ st.state="S3"│          │ st.state="S1"│          │ st.age += dt │
+    │              │          │              │          │              │
+    │ → DEATH      │          │ → REPAIR     │          │ → STAY S2    │
+    │ (absorbing)  │          │   SUCCESS    │          │ Continue     │
+    │              │          │              │          │ repair       │
+    │ Clean up     │          │ Clean up     │          │              │
+    │ checkpoint   │          │ checkpoint   │          │              │
+    └──────────────┘          └──────────────┘          └──────────────┘
+
+================================================================================
+FUNCTION: CellStateTransitionMisrepair() [Lines 1556-1834]
+================================================================================
+State transition WITH misrepair channel
+
+Additional logic for S2→S3 (compared to CellStateTransition):
+
+                    ┌─────────────────────────────────────────┐
+                    │   S2 STATE WITH MISREPAIR               │
+                    │                                         │
+                    │   [Same overlap calculations as above]  │
+                    │   p21 = repair probability              │
+                    │   p23_cat = catastrophe probability     │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   STOCHASTIC MISREPAIR CHANNEL          │
+                    │                                         │
+                    │   k_error_energy = k_error_dsb / α      │
+                    │   (convert from DSB units to energy)    │
+                    │                                         │
+                    │   λ_mis = k_error_energy × E_cur        │
+                    │   (misrepair hazard rate)               │
+                    │                                         │
+                    │   p23_mis = 1 - exp(-λ_mis × dt)        │
+                    │   (misrepair-induced death probability) │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   COMBINE DEATH CHANNELS                │
+                    │                                         │
+                    │   p23 = 1 - (1-p23_cat) × (1-p23_mis)   │
+                    │                                         │
+                    │   (catastrophe OR misrepair death)      │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                    ┌─────────────────────────────────────────┐
+                    │   CHECKPOINT BLOCKING                   │
+                    │   (if ORIGINAL or S2S3_ONLY mode)       │
+                    │                                         │
+                    │   IF cellS2HoldAge_h[cellID] < T_hold_h:│
+                    │      p23 = 0.0 (BLOCKED)                │
+                    └─────────────────────────────────────────┘
+                                       │
+                                       ▼
+                           [Same decision logic as above]
+
+================================================================================
+S3 STATE (ABSORBING) [Lines 1544-1548, 1826-1830]
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STATE: S3 (Death)                     │
+                    │                                         │
+                    │   ABSORBING STATE                       │
+                    │   - No outgoing transitions             │
+                    │   - Cell is permanently dead            │
+                    │                                         │
+                    │   Action: st.age += increaseTime        │
+                    │           (just increment age)          │
+                    │                                         │
+                    │   return;                               │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+HELPER FUNCTIONS
+================================================================================
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   InstantaneousStateJumpProb(p_sp, dt, To) [Line 1837-1842]    │
+    │                                                                 │
+    │   return p_sp;  // Direct probability (instantaneous damage)    │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   DelayedStateJumpProb(p_sp, dt, To) [Line 1844-1849]          │
+    │                                                                 │
+    │   return 1 - (1-p_sp)^(dt/To);  // Time-scaled probability     │
+    │                                                                 │
+    │   Converts cumulative probability to per-step probability      │
+    │   based on observation time To                                 │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   GaussianCDF(x, mu, sigma) [Line 142-148]                     │
+    │                                                                 │
+    │   x_norm = (x - mu) / sigma                                    │
+    │   return 0.5 × (1 + erf(x_norm / √2))                          │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   CheckpointEngagementProbability(E, E_hold, w) [Line 152-157] │
+    │                                                                 │
+    │   Logistic function:                                           │
+    │   π(E) = 1 / (1 + exp(-(E - E_hold)/w))                        │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   GatingFunction(t, T_hold, q) [Line 166-173]                  │
+    │                                                                 │
+    │   IF t >= T_hold: return 1.0                                   │
+    │   ELSE: return (t/T_hold)^q                                    │
+    │                                                                 │
+    │   Gradually releases death probability over hold duration      │
+    └─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+CHECKPOINT DESIGN MODES
+================================================================================
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   CHECKPOINT_ORIGINAL                                          │
+    │   - G2→M checkpoint (blocks division with high damage)         │
+    │   - S1→S2 checkpoint initiation                               │
+    │   - S2→S3 blocked during T_hold_h (6.0 hours default)          │
+    │   - Binary blocking: p23 = 0 during hold                       │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   CHECKPOINT_S2S3_ONLY                                         │
+    │   - Activates when PS2→S1 < PS2→S3                             │
+    │     (death probability > repair probability)                   │
+    │   - Blocks S2→S3 during hold period                           │
+    │   - Binary blocking: p23 = 0 during hold                       │
+    └─────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   CHECKPOINT_PROBABILISTIC                                     │
+    │   - Stochastic checkpoint engagement based on π(E)             │
+    │   - Samples hold duration T_hold from lognormal distribution  │
+    │   - Gradual release via gating function g(t) = (t/T_hold)^q   │
+    │   - Modifies S1→S3 and S2→S3 probabilities                    │
+    └─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+PROBABILITY FORMULAS SUMMARY
+================================================================================
+
+    State Overlap Probability:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   P(Si→Sj) = 2 × Φ(-|E_cur - Ej| / (2σ))                       │
+    │                                                                 │
+    │   where Φ = Standard Normal CDF                                │
+    │                                                                 │
+    │   This computes the overlap between current state energy       │
+    │   distribution and target state energy distribution            │
+    └─────────────────────────────────────────────────────────────────┘
+
+    Per-Step Transition Probability (Delayed):
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   p_step = 1 - (1 - P_cumulative)^(dt/To)                      │
+    │                                                                 │
+    │   where:                                                       │
+    │   - P_cumulative = overlap probability                         │
+    │   - dt = time step (hours)                                     │
+    │   - To = observation time scale (hours)                        │
+    └─────────────────────────────────────────────────────────────────┘
+
+    Misrepair Death Probability:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   λ_mis = (k_error / α) × E_cur                                │
+    │   p_mis = 1 - exp(-λ_mis × dt)                                 │
+    │                                                                 │
+    │   Combined death: p23 = 1 - (1-p23_cat)(1-p23_mis)             │
+    └─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+ENERGY UPDATE FORMULA
+================================================================================
+
+    Bi-Exponential Repair Decay:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │   E(t+dt) = E(t) × decay + dE_injected                         │
+    │                                                                 │
+    │   decay = f1 × exp(-λ1 × dt) + f2 × exp(-λ2 × dt)              │
+    │                                                                 │
+    │   Default parameters:                                          │
+    │   - f1 = 0.62 (fast component fraction)                        │
+    │   - f2 = 0.38 (slow component fraction)                        │
+    │   - λ1 = 3.31 h⁻¹ (fast repair rate, scaled by 0.1)           │
+    │   - λ2 = 0.14 h⁻¹ (slow repair rate, scaled by 0.1)           │
+    │                                                                 │
+    │   dE_injected = α × N_DSB + β × C_bystander                    │
+    └─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+END OF DECISION LOGIC DOCUMENTATION
+================================================================================
+
+

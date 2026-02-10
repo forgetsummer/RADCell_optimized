@@ -99,6 +99,23 @@ if(BUILD_PBT_TEST)
         target_include_directories(test_full_simulation PRIVATE
             ${PBT_INCLUDE_DIR}
             ${CMAKE_SOURCE_DIR}/CellMaker/include)
+        
+        # Test 7: Calibration Validation test
+        add_executable(test_calibration_validation 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_calibration_validation.cc)
+        
+        target_link_libraries(test_calibration_validation 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_calibration_validation PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "Calibration validation test configured")
     else()
         message(STATUS "OpenMP not found - skipping parallel version")
     endif()

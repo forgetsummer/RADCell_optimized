@@ -14,6 +14,8 @@ class CellLayoutInitializer
   public:
     CellLayoutInitializer();// constructor, maybe not needed somehow
     ~CellLayoutInitializer();
+    // Optional: seed internal RNG for deterministic layouts across runs
+    void SetRandomSeed(unsigned long long seed);
     void RectangularSlab(double xDim, double yDim, double zDim,int seededCellNumber);// function for seeding certain number of cells into slab
     void SetCellHomeParamter(double sizeX, double sizeY, double sizeZ);// function setting up the geometry parameter of cell home containing a cell
     double GetCellPositionX(int i){return cellPositionX[i];}

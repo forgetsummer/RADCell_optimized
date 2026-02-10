@@ -7,16 +7,30 @@
 #include <stdlib.h>
 #include "StandardNormalDistribution.hh"
 
-// Static random number generator for uniform distribution [0,1)
+// Thread-local RNG for uniform distribution [0,1)
+// - Each thread has its own engine to avoid data races under OpenMP.
+// - Default seeding uses std::random_device; for reproducibility use CellStateModel::SetRandomSeed().
 static std::mt19937& GetRandomEngine() {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
+    thread_local std::mt19937 gen;
+    thread_local bool seeded = false;
+    if (!seeded) {
+        std::random_device rd;
+        gen.seed(rd());
+        seeded = true;
+    }
     return gen;
 }
 
 static double UniformRand() {
-    static std::uniform_real_distribution<double> dist(0.0, 1.0);
+    thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
     return dist(GetRandomEngine());
+}
+
+void CellStateModel::SetRandomSeed(unsigned long long seed)
+{
+    GetRandomEngine().seed(static_cast<std::mt19937::result_type>(seed));
+    // Mark this thread as explicitly seeded
+    // (GetRandomEngine uses a thread_local 'seeded' flag; reseeding here is enough for reproducibility.)
 }
 
 
@@ -41,6 +55,7 @@ void CellStateModel::CellStateModelParameterSetup(Cell theCell)
     cellStateParaInfoMap[cType].To13 = theCell.GetCellStateParameters().To13;
     cellStateParaInfoMap[cType].To21 = theCell.GetCellStateParameters().To21;
     cellStateParaInfoMap[cType].To23 = theCell.GetCellStateParameters().To23;
+    // k_error is set separately via SetMisrepairRate (default is 0.0)
 
     cellCycleInfoMap[cType].mTG1 =theCell.GetCellCycleParameters().mTG1;
     cellCycleInfoMap[cType].sigmaTG1 = theCell.GetCellCycleParameters().sigmaTG1;
@@ -50,6 +65,13 @@ void CellStateModel::CellStateModelParameterSetup(Cell theCell)
     cellCycleInfoMap[cType].sigmaTG2 = theCell.GetCellCycleParameters().sigmaTG2;
     cellCycleInfoMap[cType].mTM = theCell.GetCellCycleParameters().mTM;
     cellCycleInfoMap[cType].sigmaTM = theCell.GetCellCycleParameters().sigmaTM;
+}
+
+void CellStateModel::SetMisrepairRate(const std::string& cellType, double k_error)
+{
+    // Set the misrepair rate for a specific cell type
+    // This enables stochastic misrepair channel in S2->S3 transitions
+    cellStateParaInfoMap[cellType].k_error = k_error;
 }
 
 void CellStateModel::TissueGeometryInitialization(double xDim, double yDim, double zDim, double gridSize)
@@ -124,6 +146,39 @@ double CellStateModel::GaussianCDF(double x, double mu, double sigma)
     p_CDF = 0.5*(1+erf(x_stdNORM/sqrt(2)));
     return p_CDF;// return the probability of N(x,mu, sigma)
 
+}
+
+// Helper functions for probabilistic checkpoint model
+double CellStateModel::CheckpointEngagementProbability(double E, double E_hold, double w)
+{
+    // Logistic function: π(E) = 1 / (1 + exp(-(E - E_hold)/w))
+    if (w <= 0.0) return (E >= E_hold) ? 1.0 : 0.0;
+    return 1.0 / (1.0 + exp(-(E - E_hold) / w));
+}
+
+double CellStateModel::SampleLogNormal(double mu, double sigma)
+{
+    // Sample lognormal distribution: if Z ~ N(0,1), then exp(mu + sigma*Z) ~ LogNormal(mu, sigma^2)
+    double z = GaussianSampling(0.0, 1.0);
+    return exp(mu + sigma * z);
+}
+
+double CellStateModel::GatingFunction(double t, double T_hold, double q)
+{
+    // Gating function: g(t; T_hold) = (t/T_hold)^q for t < T_hold, else 1
+    if (T_hold <= 0.0) return 1.0;
+    if (t >= T_hold) return 1.0;
+    if (t <= 0.0) return 0.0;
+    return pow(t / T_hold, q);
+}
+
+double CellStateModel::SaturatingLogMean(double Ecur, double E_hold, double w_E)
+{
+    // Saturating function: s(E) = 1 / (1 + exp(-(E - E_hold)/w_E))
+    // Returns value in [0, 1] for use in μ_E calculation
+    // This bounds T_hold to realistic timescales by saturating the log-mean parameter
+    if (w_E <= 0.0) return (Ecur >= E_hold) ? 1.0 : 0.0;
+    return 1.0 / (1.0 + exp(-(Ecur - E_hold) / w_E));
 }
 
 
@@ -274,6 +329,10 @@ void CellStateModel::CellStateInitialization(int cellID,string cState)
     StateInfo cellState;
     cellState.state = cState;
     cellState.age =0;
+    // IMPORTANT: Initialize state energy deterministically.
+    // If left uninitialized, st.E can become NaN/garbage and silently prevent transitions,
+    // severely biasing survival (especially at 0 Gy and after division).
+    cellState.E = 0.0;
     if ((cState!="S1") && ( cState!="S2")&& (cState!="S3"))
     {
         cout<<cState<<endl;
@@ -303,6 +362,7 @@ void CellStateModel::CellStateInitialization(int cellID,string cState)
         double pi = 3.1415926535897;
         double arrestedDuration = E20/sqrt(2*pi)/sigma*(f1/lambda1+f2/lambda2);
         cellState.duration = arrestedDuration;
+        cellState.E = E20;
     }
     if(cState=="S22")
     {
@@ -772,12 +832,21 @@ void CellStateModel::CellPhaseUpdate(int cellID, bool proliferationState, double
     if (itT == cellTypeMap.end()) return;
 
 
-    // 2) Safe read (no insertion)
-    const bool proliferativeFromCellState = (itState->second.state == "S1");
+	    // 2) Safe read (no insertion)
+	    const std::string& state = itState->second.state;
 
-    // 3) Write is OK; here operator[] is acceptable if you want it to exist for all cells.
-    // If you want to avoid insertion too, use find/at pattern.
-    cellProliferativeMap[cellID] = (proliferationState && proliferativeFromCellState);//     cellProliferativeMap[cellID] =(proliferationState);//when the nutrient condtion and healthy state all true, then it goes to proliferation
+	    // Cell-cycle progression policy:
+	    // - S1: proliferative/clonogenic
+	    // - S2: repair/arrest (NON-proliferative)
+	    // - S3: dead (NON-proliferative)
+	    //
+	    // Allowing S2 cells to keep cycling (even after a finite hold) lets them reach mitosis
+	    // and "reset" damage on division, which can strongly overpredict survival.
+	    const bool proliferativeFromCellState = (state == "S1");
+
+	    // 3) Write is OK; here operator[] is acceptable if you want it to exist for all cells.
+	    // If you want to avoid insertion too, use find/at pattern.
+	    cellProliferativeMap[cellID] = (proliferationState && proliferativeFromCellState);//     cellProliferativeMap[cellID] =(proliferationState);//when the nutrient condtion and healthy state all true, then it goes to proliferation
 
     CellPhaseTransition(cellID, deltaT, frequency);
 //     cout<<"CELL: "<<cellID<<" : "<<"AGE IS: "<<cellPhaseMap[cellID].age<<" PHASE IS: "<<cellPhaseMap[cellID].phase<<endl;
@@ -918,6 +987,44 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         if (phase.age <= phase.duration)
             return;
 
+        // ---- Priority 3: Mitotic Catastrophe Check ----
+        // Check residual damage before allowing division (only for S1/S2 cells)
+        if (itSt != cellStateMap.end()) {
+            const std::string& state = itSt->second.state;
+            if (state == "S1" || state == "S2") {  // Only check viable cells
+                double Ecur = itSt->second.E;
+                
+                // Use phase-specific E3 for mitotic threshold
+                const double E3 = cellStateParaInfoMap.at(cellType).E3;
+                const double sigma = cellStateParaInfoMap.at(cellType).sigma;
+                double E3_mitotic = E3 * 0.7;  // Lower threshold for mitotic catastrophe
+                
+                // Use soft saturation (consistent with Priority 1)
+                // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+                double p_death = 0.0;
+                double mitotic_threshold = softSaturationEnabled ? 
+                    (E3_mitotic + softSaturationMargin * sigma) : E3_mitotic;
+                if (Ecur >= mitotic_threshold) {
+                    p_death = 1.0;
+                } else {
+                    double E_mitotic = -std::fabs(Ecur - E3_mitotic) / (2.0 * sigma);
+                    p_death = 2.0 * GaussianCDF(E_mitotic, 0, 1);
+                    p_death = std::max(0.0, std::min(1.0, p_death));  // Clamp to [0,1]
+                }
+                
+                if (UniformRand() < p_death) {
+                    // Mitotic catastrophe - cell dies instead of dividing
+                    itSt->second.state = "S3";
+                    // Clean up checkpoint tracking (avoid stale entries in diagnostics)
+                    cellS2HoldAge_h.erase(cellID);
+                    cellT_hold_h.erase(cellID);
+                    cellCheckpointEngaged.erase(cellID);
+                    // Don't divide - cell is dead
+                    return;
+                }
+            }
+        }
+
         // ---- Division happens now ----
         // Recompute possible positions (space may have changed during M phase)
         std::map<std::string, PositionInfo> possibleCellHomeForMitosis;
@@ -964,6 +1071,7 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellStateMap[id1].state = "S1";
         cellStateMap[id1].age = 0;
         cellStateMap[id1].duration = 1E+18;
+        cellStateMap[id1].E = 0.0;
 
         cellPositionMap[id1] = motherPos;
         cellHomeResidence[motherPos.i][motherPos.j][motherPos.k] = 1;
@@ -984,6 +1092,7 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellStateMap[id2].state = "S1";
         cellStateMap[id2].age = 0;
         cellStateMap[id2].duration = 1E+18;
+        cellStateMap[id2].E = 0.0;
 
         cellPositionMap[id2] = pick->second;
         cellHomeResidence[pick->second.i][pick->second.j][pick->second.k] = 1;
@@ -995,6 +1104,12 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellPositionMap.erase(cellID);
         cellTypeMap.erase(cellID);
         cellProliferativeMap.erase(cellID);
+        cellExternalPerturbationEnergyMap.erase(cellID);
+        cellDamageEnergyMap.erase(cellID);
+        cellInitialDSBMap.erase(cellID);
+        cellS2HoldAge_h.erase(cellID);
+        cellT_hold_h.erase(cellID);
+        cellCheckpointEngaged.erase(cellID);
 
         return;
     }
@@ -1052,6 +1167,15 @@ void CellStateModel::CellStateUpdate(int cellID,
     // update state energy
     st.E = st.E * decay + dEinj;
 
+    // Store initial DSB count (legacy/diagnostic; misrepair now uses current E)
+    if (DSBNum > 0) {
+        // New damage: store initial DSB count (for misrepair calculation)
+        // Only set if not already set (to preserve initial value)
+        if (cellInitialDSBMap.find(cellID) == cellInitialDSBMap.end()) {
+            cellInitialDSBMap[cellID] = DSBNum;
+        }
+    }
+
     // instantaneous vs delayed transition type
     const bool transitionType = (DSBNum > 0);
 
@@ -1060,14 +1184,34 @@ void CellStateModel::CellStateUpdate(int cellID,
     const double E2    = cellStateParaInfoMap.at(cellType).E2;
     const double E3    = cellStateParaInfoMap.at(cellType).E3;
     const double sigma = cellStateParaInfoMap.at(cellType).sigma;
+    const double k_error = cellStateParaInfoMap.at(cellType).k_error;  // Check if misrepair is enabled
 
     // current phase string (safe via iterator)
     const std::string& ph = itPhase->second.phase;
 
+    // Choose transition function: use misrepair if k_error > 0
+    bool useMisrepair = (k_error > 1e-10);
+
+    // ---- Checkpoint hold logic (Probabilistic Checkpoint) ----
+    // Increment checkpoint hold age for cells in S2 checkpoint hold
+    if (checkpointEnabled) {
+        if (itState != cellStateMap.end() && itState->second.state == "S2") {
+            auto itHoldAge = cellS2HoldAge_h.find(cellID);
+            if (itHoldAge != cellS2HoldAge_h.end()) {
+                // Cell is in checkpoint hold - increment hold age
+                itHoldAge->second += increaseTime;
+            }
+        }
+    }
+
     // ---- 1) Dispatch by phase (keep your original formulas) ----
     if (ph == "G1")
     {
-        CellStateTransition(cellID, E1, E2, E3, sigma, increaseTime, transitionType);
+        if (useMisrepair) {
+            CellStateTransitionMisrepair(cellID, E1, E2, E3, sigma, increaseTime, transitionType);
+        } else {
+            CellStateTransition(cellID, E1, E2, E3, sigma, increaseTime, transitionType);
+        }
     }
     else if (ph == "S")
     {
@@ -1077,7 +1221,11 @@ void CellStateModel::CellStateUpdate(int cellID,
         const double E3_S = std::sqrt(E3 * E3 - 8.0 * sigma * sigma * std::log(fS));
         const double E2_S = E3_S - std::sqrt((E3 - E2) * (E3 - E2) - 8.0 * sigma * sigma * std::log(fS));
 
-        CellStateTransition(cellID, E1_S, E2_S, E3_S, sigma, increaseTime, transitionType);
+        if (useMisrepair) {
+            CellStateTransitionMisrepair(cellID, E1_S, E2_S, E3_S, sigma, increaseTime, transitionType);
+        } else {
+            CellStateTransition(cellID, E1_S, E2_S, E3_S, sigma, increaseTime, transitionType);
+        }
     }
     else if (ph == "G2")
     {
@@ -1087,7 +1235,11 @@ void CellStateModel::CellStateUpdate(int cellID,
         const double E3_G2 = std::sqrt(E3 * E3 - 8.0 * sigma * sigma * std::log(fG2));
         const double E2_G2 = E3_G2 - std::sqrt((E3 - E2) * (E3 - E2) - 8.0 * sigma * sigma * std::log(fG2));
 
-        CellStateTransition(cellID, E1_G2, E2_G2, E3_G2, sigma, increaseTime, transitionType);
+        if (useMisrepair) {
+            CellStateTransitionMisrepair(cellID, E1_G2, E2_G2, E3_G2, sigma, increaseTime, transitionType);
+        } else {
+            CellStateTransition(cellID, E1_G2, E2_G2, E3_G2, sigma, increaseTime, transitionType);
+        }
     }
     else if (ph == "M")
     {
@@ -1097,12 +1249,20 @@ void CellStateModel::CellStateUpdate(int cellID,
         const double E3_M = std::sqrt(E3 * E3 - 8.0 * sigma * sigma * std::log(fM));
         const double E2_M = E3_M - std::sqrt((E3 - E2) * (E3 - E2) - 8.0 * sigma * sigma * std::log(fM));
 
-        CellStateTransition(cellID, E1_M, E2_M, E3_M, sigma, increaseTime, transitionType);
+        if (useMisrepair) {
+            CellStateTransitionMisrepair(cellID, E1_M, E2_M, E3_M, sigma, increaseTime, transitionType);
+        } else {
+            CellStateTransition(cellID, E1_M, E2_M, E3_M, sigma, increaseTime, transitionType);
+        }
     }
     else if (ph == "G0")
     {
         // keep your original "treat G0 like G1" idea
-        CellStateTransition(cellID, 0.0, E2, E3, sigma, increaseTime, transitionType);
+        if (useMisrepair) {
+            CellStateTransitionMisrepair(cellID, 0.0, E2, E3, sigma, increaseTime, transitionType);
+        } else {
+            CellStateTransition(cellID, 0.0, E2, E3, sigma, increaseTime, transitionType);
+        }
     }
     else
     {
@@ -1155,8 +1315,13 @@ void CellStateModel::CellStateTransition(int cellID,
         double ES1ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
         double PS1ToS3 = 2.0 * GaussianCDF(ES1ToS3, 0, 1);
 
-        // Saturation (your design)
-        if (Ecur >= E3) PS1ToS3 = 1.0;
+        // Soft saturation: only trigger at extreme margin (Priority 1)
+        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+        if (softSaturationEnabled) {
+            if (Ecur >= E3 + softSaturationMargin * sigma) PS1ToS3 = 1.0;
+        } else {
+            if (Ecur >= E3) PS1ToS3 = 1.0;  // Hard saturation
+        }
 
         // Map cumulative probability -> per-step probability
         double p12_step = 0.0;
@@ -1172,6 +1337,28 @@ void CellStateModel::CellStateTransition(int cellID,
         p12_step = clamp01(p12_step);
         p13_step = clamp01(p13_step);
 
+        // Probabilistic checkpoint: modify probabilities if enabled
+        if (checkpointEnabled) {
+            // Calculate checkpoint engagement probability
+            const double E_hold = E3 - k_hold * sigma;
+            const double pi_E = CheckpointEngagementProbability(Ecur, E_hold, w_hold);
+            
+            // Store baseline probabilities
+            const double p12_0 = p12_step;
+            const double p13_0 = p13_step;
+            
+            // Apply marginalization formulas
+            // Use effective_eta = eta directly (default eta = 1.0)
+            double effective_eta = eta;
+            
+            p13_step = (1.0 - effective_eta * pi_E) * p13_0;
+            p12_step = p12_0 + effective_eta * pi_E * p13_0;
+            
+            // Re-clamp after modification
+            p12_step = clamp01(p12_step);
+            p13_step = clamp01(p13_step);
+        }
+
         // Ensure total <= 1
         const double pSum = p12_step + p13_step;
         if (pSum > 1.0) {
@@ -1183,10 +1370,58 @@ void CellStateModel::CellStateTransition(int cellID,
         const double u = UniformRand();
         if (u < p13_step) {
             st.state = "S3";
+            // Clean up checkpoint tracking if exists
+            if (checkpointEnabled) {
+                cellS2HoldAge_h.erase(cellID);
+                cellT_hold_h.erase(cellID);
+                cellCheckpointEngaged.erase(cellID);
+            }
             // optionally reset age/duration here if your model expects it
         }
         else if (u < p13_step + p12_step) {
             st.state = "S2";
+            // Probabilistic checkpoint: determine if checkpoint was engaged
+            if (checkpointEnabled) {
+                const double E_hold = E3 - k_hold * sigma;
+                const double pi_E = CheckpointEngagementProbability(Ecur, E_hold, w_hold);
+                
+                // Sample checkpoint engagement
+                const double u_checkpoint = UniformRand();
+	                if (u_checkpoint < pi_E) {
+	                    // Checkpoint engaged: sample hold duration and store
+	                    // Use a cell-cycle-scaled lognormal hold distribution to keep arrest times
+	                    // consistent across cell types with different cycle lengths.
+	                    const double s_E = SaturatingLogMean(Ecur, E_hold, w_E_hold);
+	                    const CycleInfo& cyc = cellCycleInfoMap.at(cellType);
+	                    const double T_cycle = cyc.mTG1 + cyc.mTS + cyc.mTG2 + cyc.mTM; // hours
+	                    const double T_cycle_safe =
+	                        (std::isfinite(T_cycle) && T_cycle > 0.0) ? T_cycle : 1.0;
+
+	                    const double median_min_h =
+	                        std::max(1e-6, holdMedianMinCycleFraction * T_cycle_safe);
+	                    const double median_max_h =
+	                        std::max(median_min_h, holdMedianMaxCycleFraction * T_cycle_safe);
+
+	                    const double mu_min = std::log(median_min_h);
+	                    const double mu_max = std::log(median_max_h);
+	                    const double mu_E = mu_min + (mu_max - mu_min) * s_E;
+
+	                    double T_hold = SampleLogNormal(mu_E, sigmaT_hold);
+	                    const double clamp_min_h =
+	                        std::max(1e-6, holdClampMinCycleFraction * T_cycle_safe);
+	                    const double clamp_max_h =
+	                        std::max(clamp_min_h, holdClampMaxCycleFraction * T_cycle_safe);
+	                    if (T_hold < clamp_min_h) T_hold = clamp_min_h;
+	                    else if (T_hold > clamp_max_h) T_hold = clamp_max_h;
+	                    
+	                    cellT_hold_h[cellID] = T_hold;
+	                    cellCheckpointEngaged[cellID] = true;
+	                    cellS2HoldAge_h[cellID] = 0.0;  // Initialize hold age
+                } else {
+                    // No checkpoint: cell enters S2 normally
+                    cellCheckpointEngaged[cellID] = false;
+                }
+            }
             // optionally reset age/duration here if your model expects it
         }
         else {
@@ -1210,16 +1445,41 @@ void CellStateModel::CellStateTransition(int cellID,
         double ES2ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
         double PS2ToS3 = 2.0 * GaussianCDF(ES2ToS3, 0, 1);
 
-        if (Ecur >= E3) PS2ToS3 = 1.0;
+        // Soft saturation: only trigger at extreme margin (Priority 1)
+        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+        if (softSaturationEnabled) {
+            if (Ecur >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
+        } else {
+            if (Ecur >= E3) PS2ToS3 = 1.0;  // Hard saturation
+        }
 
+        // Calculate baseline transition probabilities
         double p21_step = 0.0;
-        double p23_step = 0.0;
+        double p23_0_step = 0.0;
         if (transitionType) {
             p21_step = InstantaneousStateJumpProb(PS2ToS1, increaseTime, To21);
-            p23_step = InstantaneousStateJumpProb(PS2ToS3, increaseTime, To23);
+            p23_0_step = InstantaneousStateJumpProb(PS2ToS3, increaseTime, To23);
         } else {
             p21_step = DelayedStateJumpProb(PS2ToS1, increaseTime, To21);
-            p23_step = DelayedStateJumpProb(PS2ToS3, increaseTime, To23);
+            p23_0_step = DelayedStateJumpProb(PS2ToS3, increaseTime, To23);
+        }
+        
+        // Probabilistic checkpoint: apply gating function if in checkpoint
+        double p23_step = p23_0_step;
+        if (checkpointEnabled) {
+            auto itEngaged = cellCheckpointEngaged.find(cellID);
+            if (itEngaged != cellCheckpointEngaged.end() && itEngaged->second) {
+                // Cell is in checkpoint hold
+                auto itHoldAge = cellS2HoldAge_h.find(cellID);
+                auto itT_hold = cellT_hold_h.find(cellID);
+                if (itHoldAge != cellS2HoldAge_h.end() && itT_hold != cellT_hold_h.end()) {
+                    const double t = itHoldAge->second;  // Current hold age
+                    const double T_hold = itT_hold->second;  // Sampled hold duration
+                    const double g = GatingFunction(t, T_hold, q_gate);
+                    // Apply gating to catastrophe probability
+                    p23_step = g * p23_0_step;
+                }
+            }
         }
 
         p21_step = clamp01(p21_step);
@@ -1234,9 +1494,21 @@ void CellStateModel::CellStateTransition(int cellID,
         const double u = UniformRand();
         if (u < p23_step) {
             st.state = "S3";
+            // Clean up checkpoint tracking when cell dies (Priority 2)
+            if (checkpointEnabled) {
+                cellS2HoldAge_h.erase(cellID);
+                cellT_hold_h.erase(cellID);
+                cellCheckpointEngaged.erase(cellID);
+            }
         }
         else if (u < p23_step + p21_step) {
             st.state = "S1";
+            // Clean up checkpoint tracking when cell repairs (Priority 2)
+            if (checkpointEnabled) {
+                cellS2HoldAge_h.erase(cellID);
+                cellT_hold_h.erase(cellID);
+                cellCheckpointEngaged.erase(cellID);
+            }
         }
         else {
             st.age += increaseTime;
@@ -1257,6 +1529,301 @@ void CellStateModel::CellStateTransition(int cellID,
     return;
 }
 
+
+
+void CellStateModel::CellStateTransitionMisrepair(int cellID,
+                                        double E1, double E2, double E3,
+                                        double sigma,
+                                        double increaseTime,
+                                        bool transitionType) // true=instantaneous, false=delayed
+{
+    // ---- 0) Guard: cell might have been deleted earlier this tick ----
+    auto itState = cellStateMap.find(cellID);
+    if (itState == cellStateMap.end())
+        return;
+
+    // Reference (alias) to the map-stored StateInfo (no copy)
+    auto& st = itState->second;
+
+    // Helper to keep probabilities sane
+    auto clamp01 = [](double x) {
+        if (x < 0.0) return 0.0;
+        if (x > 1.0) return 1.0;
+        return x;
+    };
+
+
+    auto itType  = cellTypeMap.find(cellID);
+    const std::string cellType = itType->second.GetCellType();
+    const double To12 =cellStateParaInfoMap.at(cellType).To12;
+    const double To13 = cellStateParaInfoMap.at(cellType).To13;
+    const double To21 = cellStateParaInfoMap.at(cellType).To21;
+    const double To23 = cellStateParaInfoMap.at(cellType).To23;
+    const CellStateParaInfo& par = cellStateParaInfoMap.at(cellType);
+
+    // =========================
+    // S1 transitions
+    // =========================
+    if (st.state == "S1")
+    {
+        const double Ecur = st.E;
+
+        // Overlap-based cumulative probabilities over observation window To
+        double ES1ToS2 = -std::fabs(Ecur - E2) / (2.0 * sigma);
+        double PS1ToS2 = 2.0 * GaussianCDF(ES1ToS2, 0, 1);
+
+        double ES1ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
+        double PS1ToS3 = 2.0 * GaussianCDF(ES1ToS3, 0, 1);
+
+        // Soft saturation: only trigger at extreme margin (Priority 1)
+        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+        if (softSaturationEnabled) {
+            if (Ecur >= E3 + softSaturationMargin * sigma) PS1ToS3 = 1.0;
+        } else {
+            if (Ecur >= E3) PS1ToS3 = 1.0;  // Hard saturation
+        }
+
+        // Map cumulative probability -> per-step probability
+        double p12_step = 0.0;
+        double p13_step = 0.0;
+        if (transitionType) {
+            p12_step = InstantaneousStateJumpProb(PS1ToS2, increaseTime, To12);
+            p13_step = InstantaneousStateJumpProb(PS1ToS3, increaseTime, To13);
+        } else {
+            p12_step = DelayedStateJumpProb(PS1ToS2, increaseTime, To12);
+            p13_step = DelayedStateJumpProb(PS1ToS3, increaseTime, To13);
+        }
+
+        p12_step = clamp01(p12_step);
+        p13_step = clamp01(p13_step);
+
+        // Probabilistic checkpoint: modify probabilities if enabled
+        if (checkpointEnabled) {
+            // Calculate checkpoint engagement probability
+            const double E_hold = E3 - k_hold * sigma;
+            const double pi_E = CheckpointEngagementProbability(Ecur, E_hold, w_hold);
+            
+            // Store baseline probabilities
+            const double p12_0 = p12_step;
+            const double p13_0 = p13_step;
+            
+            // Apply marginalization formulas
+            // Use effective_eta = eta directly (default eta = 1.0)
+            double effective_eta = eta;
+            
+            p13_step = (1.0 - effective_eta * pi_E) * p13_0;
+            p12_step = p12_0 + effective_eta * pi_E * p13_0;
+            
+            // Re-clamp after modification
+            p12_step = clamp01(p12_step);
+            p13_step = clamp01(p13_step);
+        }
+
+        // Ensure total <= 1
+        const double pSum = p12_step + p13_step;
+        if (pSum > 1.0) {
+            p12_step /= pSum;
+            p13_step /= pSum;
+        }
+
+        // Competing transitions: S3 priority then S2 (same as earlier)
+        const double u = UniformRand();
+        if (u < p13_step) {
+            st.state = "S3";
+            // Clean up checkpoint tracking if exists
+            cellS2HoldAge_h.erase(cellID);
+            cellT_hold_h.erase(cellID);
+            cellCheckpointEngaged.erase(cellID);
+            // optionally reset age/duration here if your model expects it
+        }
+        else if (u < p13_step + p12_step) {
+            st.state = "S2";
+            // Probabilistic checkpoint: determine if checkpoint was engaged
+            if (checkpointEnabled) {
+                const double E_hold = E3 - k_hold * sigma;
+                const double pi_E = CheckpointEngagementProbability(Ecur, E_hold, w_hold);
+                
+                // Sample checkpoint engagement
+                const double u_checkpoint = UniformRand();
+	                if (u_checkpoint < pi_E) {
+	                    // Checkpoint engaged: sample hold duration and store
+	                    // Use a cell-cycle-scaled lognormal hold distribution to keep arrest times
+	                    // consistent across cell types with different cycle lengths.
+	                    const double s_E = SaturatingLogMean(Ecur, E_hold, w_E_hold);
+	                    const CycleInfo& cyc = cellCycleInfoMap.at(cellType);
+	                    const double T_cycle = cyc.mTG1 + cyc.mTS + cyc.mTG2 + cyc.mTM; // hours
+	                    const double T_cycle_safe =
+	                        (std::isfinite(T_cycle) && T_cycle > 0.0) ? T_cycle : 1.0;
+
+	                    const double median_min_h =
+	                        std::max(1e-6, holdMedianMinCycleFraction * T_cycle_safe);
+	                    const double median_max_h =
+	                        std::max(median_min_h, holdMedianMaxCycleFraction * T_cycle_safe);
+
+	                    const double mu_min = std::log(median_min_h);
+	                    const double mu_max = std::log(median_max_h);
+	                    const double mu_E = mu_min + (mu_max - mu_min) * s_E;
+
+	                    double T_hold = SampleLogNormal(mu_E, sigmaT_hold);
+	                    const double clamp_min_h =
+	                        std::max(1e-6, holdClampMinCycleFraction * T_cycle_safe);
+	                    const double clamp_max_h =
+	                        std::max(clamp_min_h, holdClampMaxCycleFraction * T_cycle_safe);
+	                    if (T_hold < clamp_min_h) T_hold = clamp_min_h;
+	                    else if (T_hold > clamp_max_h) T_hold = clamp_max_h;
+	                    
+	                    cellT_hold_h[cellID] = T_hold;
+	                    cellCheckpointEngaged[cellID] = true;
+	                    cellS2HoldAge_h[cellID] = 0.0;  // Initialize hold age
+                } else {
+                    // No checkpoint: cell enters S2 normally
+                    cellCheckpointEngaged[cellID] = false;
+                }
+            }
+            // optionally reset age/duration here if your model expects it
+        }
+        else {
+            st.age += increaseTime;
+        }
+        return;
+    }
+
+    // =========================
+    // S2 transitions (with misrepair channel)
+    // =========================
+    if (st.state == "S2")
+    {
+        const double Ecur = st.E;
+
+        double ES2ToS1 = -std::fabs(Ecur - E1) / (2.0 * sigma);
+        double PS2ToS1 = 2.0 * GaussianCDF(ES2ToS1, 0, 1);
+
+        double ES2ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
+        double PS2ToS3 = 2.0 * GaussianCDF(ES2ToS3, 0, 1);
+        // Soft saturation: only trigger at extreme margin (Priority 1)
+        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+        if (softSaturationEnabled) {
+            if (Ecur >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
+        } else {
+            if (Ecur >= E3) PS2ToS3 = 1.0;  // Hard saturation
+        }
+
+        double p21_step = 0.0;
+        double p23_energy_0_step = 0.0;
+        if (transitionType) {
+            p21_step        = InstantaneousStateJumpProb(PS2ToS1, increaseTime, To21);
+            p23_energy_0_step = InstantaneousStateJumpProb(PS2ToS3, increaseTime, To23);
+        } else {
+            p21_step        = DelayedStateJumpProb(PS2ToS1, increaseTime, To21);
+            p23_energy_0_step = DelayedStateJumpProb(PS2ToS3, increaseTime, To23);
+        }
+
+        p21_step        = clamp01(p21_step);
+        p23_energy_0_step = clamp01(p23_energy_0_step);
+
+        // Probabilistic checkpoint: apply gating function to catastrophe probability
+        double p23_cat_step = p23_energy_0_step;
+        if (checkpointEnabled) {
+            auto itEngagedMis = cellCheckpointEngaged.find(cellID);
+            if (itEngagedMis != cellCheckpointEngaged.end() && itEngagedMis->second) {
+                // Cell is in checkpoint hold
+                auto itHoldAgeMis = cellS2HoldAge_h.find(cellID);
+                auto itT_holdMis = cellT_hold_h.find(cellID);
+                if (itHoldAgeMis != cellS2HoldAge_h.end() && itT_holdMis != cellT_hold_h.end()) {
+                    const double t = itHoldAgeMis->second;  // Current hold age
+                    const double T_hold = itT_holdMis->second;  // Sampled hold duration
+                    const double g = GatingFunction(t, T_hold, q_gate);
+                    // Apply gating to catastrophe probability
+                    p23_cat_step = g * p23_energy_0_step;
+                }
+            }
+        }
+
+        // =========================
+        // MISREPAIR ON RECOVERY ATTEMPT (Version 2)
+        // 
+        // Radiobiological interpretation:
+        //   - Misrepair represents mitotic catastrophe: cells leave arrest,
+        //     try to divide with misrepaired damage, then fail.
+        //   - Misrepair death is triggered when cell ATTEMPTS recovery (S2→S1),
+        //     not as a constant background hazard.
+        //
+        // Logic:
+        //   p_mis = probability of lethal misrepair given a recovery attempt
+        //   p23_mis = p21 × p_mis      (death via failed recovery)
+        //   p21_eff = p21 × (1-p_mis)  (successful recovery)
+        //   p23 = p23_cat + p23_mis    (total death: catastrophe + misrepair)
+        //
+        // This produces LQ-like behavior:
+        //   - Misrepair on recovery → linear αD component (low dose)
+        //   - Catastrophe → quadratic βD² component (high dose)
+        // =========================
+        const double k_error_dsb = par.k_error; // per (DSB*hour)
+        const double alpha_dsb   = par.alpha;   // energy per DSB
+
+        const double k_error_energy =
+            (alpha_dsb > 0.0) ? (std::max(0.0, k_error_dsb) / alpha_dsb) : 0.0; // 1/(energy*hour)
+
+        // Misrepair probability (conditional on recovery attempt)
+        const double lambda_mis = k_error_energy * std::max(0.0, Ecur); // 1/h
+        double p_mis = 1.0 - std::exp(-lambda_mis * std::max(0.0, increaseTime));
+        p_mis = clamp01(p_mis);
+
+        // Misrepair death only occurs when cell attempts recovery
+        double p23_mis_step = p21_step * p_mis;           // Death via failed recovery
+        double p21_eff_step = p21_step * (1.0 - p_mis);   // Successful recovery
+
+        // Total death = catastrophe + misrepair (mutually exclusive paths)
+        double p23_step = p23_cat_step + p23_mis_step;
+        p23_step = clamp01(p23_step);
+
+        // Update p21 to effective recovery probability
+        p21_step = p21_eff_step;
+
+        // Renormalize if needed (should not exceed 1 with this logic, but safety check)
+        const double pSum = p21_step + p23_step;
+        if (pSum > 1.0) {
+            p21_step /= pSum;
+            p23_step /= pSum;
+        }
+
+        const double u = UniformRand();
+        if (u < p23_step) {
+            st.state = "S3";
+            // Clean up checkpoint tracking when cell dies (Priority 2)
+            if (checkpointEnabled) {
+                cellS2HoldAge_h.erase(cellID);
+                cellT_hold_h.erase(cellID);
+                cellCheckpointEngaged.erase(cellID);
+            }
+        }
+        else if (u < p23_step + p21_step) {
+            st.state = "S1";
+            // Clean up checkpoint tracking when cell repairs (Priority 2)
+            if (checkpointEnabled) {
+                cellS2HoldAge_h.erase(cellID);
+                cellT_hold_h.erase(cellID);
+                cellCheckpointEngaged.erase(cellID);
+            }
+        }
+        else {
+            st.age += increaseTime;
+        }
+        return;
+    }
+
+    // =========================
+    // S3 transitions (absorbing)
+    // =========================
+    if (st.state == "S3")
+    {
+        st.age += increaseTime;
+        return;
+    }
+
+    // Unknown state string -> do nothing
+    return;
+}
 
 
 double CellStateModel::InstantaneousStateJumpProb(double p_sp, double increaseTime, double ObservationTime)
@@ -1368,6 +1935,43 @@ map< int, double > CellStateModel::GetCellPositionZ()
         ZPositionMap[mitr_cell->first] =  mitr_cell->second.k*d;//when take the grid points as center of cell
     }
     return ZPositionMap;
+}
+
+// Priority 2: Checkpoint hold diagnostics
+std::map<int, double> CellStateModel::GetCheckpointHoldAge()
+{
+    return cellS2HoldAge_h;  // Return copy of checkpoint hold age map
+}
+
+int CellStateModel::GetCheckpointHoldCount()
+{
+    return static_cast<int>(cellS2HoldAge_h.size());  // Number of cells in checkpoint hold
+}
+
+void CellStateModel::SetCheckpointEnabled(bool enabled)
+{
+    checkpointEnabled = enabled;
+    if (!enabled) {
+        // Clear checkpoint tracking when disabling
+        cellS2HoldAge_h.clear();
+        cellT_hold_h.clear();
+        cellCheckpointEngaged.clear();
+    }
+}
+
+bool CellStateModel::IsCheckpointEnabled() const
+{
+    return checkpointEnabled;
+}
+
+void CellStateModel::SetSoftSaturationEnabled(bool enabled)
+{
+    softSaturationEnabled = enabled;
+}
+
+bool CellStateModel::IsSoftSaturationEnabled() const
+{
+    return softSaturationEnabled;
 }
 
 map< int, int > CellStateModel::GetCellAncestryID()
@@ -1494,5 +2098,3 @@ CellStateModelParameter CellStateModel::GetCellStateModelParameters(double p_sp,
   
 
 }
-
-

@@ -31,6 +31,7 @@ add_subdirectory(CellMaker)
 add_subdirectory(ReactionDiffusionSolver)
 add_subdirectory(PhysicalBioTranslator)
 add_subdirectory(PIDEDataReader)
+add_subdirectory(CellStateModelCalibration)
 
 #----------------------------------------------------------------------------
 # Locate sources and headers for the main project
@@ -41,6 +42,7 @@ include_directories(${PROJECT_SOURCE_DIR}/include
                     ${PROJECT_SOURCE_DIR}/ReactionDiffusionSolver/include
                     ${PROJECT_SOURCE_DIR}/PhysicalBioTranslator/include
                     ${PROJECT_SOURCE_DIR}/PIDEDataReader/include
+                    ${PROJECT_SOURCE_DIR}/CellStateModelCalibration/include
                     ${Geant4_INCLUDE_DIR})
 
 # Get all source files except those in modules

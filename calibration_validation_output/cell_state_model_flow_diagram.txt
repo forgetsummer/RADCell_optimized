@@ -1,0 +1,478 @@
+================================================================================
+REPAIR MEDIATED CELL STATE MODEL - COMPLETE FLOW DIAGRAM
+================================================================================
+Based on Calibrated Parameters from Last Run (5 replicates)
+
+Calibrated Parameters:
+  E1 = 0.0 (Healthy baseline)
+  E2 = 36.23 (Repair threshold)
+  E3 = 69.49 (Death threshold)
+  σ = 10.0 (Transition width)
+  α = 0.529 (Damage per DSB)
+  κ = 40 DSB/Gy
+  T21 = 10.0 hours (Repair timescale)
+  T23 = 10.0 hours (Death timescale)
+  k_error = 1e-10 per (DSB×hour) [Effectively disabled]
+  Checkpoint: ENABLED (Original Design)
+  Soft Saturation: ENABLED (E3 + 1σ = 79.49) [Note: margin=1.0 by default, not 3.0]
+
+Target LQ Model: α_LQ = 0.75 Gy⁻¹, β_LQ = 0.11 Gy⁻²
+
+================================================================================
+OVERVIEW: THREE-STATE SYSTEM
+================================================================================
+
+    ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+    │             │  Damage │             │  Death  │             │
+    │     S1      │────────>│     S2      │────────>│     S3      │
+    │  (Healthy)  │         │  (Repair)   │         │   (Dead)    │
+    │             │<────────│             │         │             │
+    └─────────────┘  Repair └─────────────┘         └─────────────┘
+          │                                               ▲
+          │              Direct Lethal                    │
+          └───────────────────────────────────────────────┘
+
+    S1: Healthy/Clonogenic - Can proliferate and form colonies
+    S2: Repair State - Non-clonogenic, attempting repair
+    S3: Death State - Absorbing state, cell removed
+
+================================================================================
+STEP 1: INITIAL STATE (S1) - RADIATION EXPOSURE
+================================================================================
+
+                    ┌─────────────────────────────────┐
+                    │   INITIAL STATE: S1 (Healthy)   │
+                    │   Energy: E = 0 (baseline)      │
+                    │   DSB: 0                        │
+                    └─────────────────────────────────┘
+                                   │
+                                   │ Radiation Exposure
+                                   │ Dose D (Gy)
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │   STEP 1a: Calculate DSB        │
+                    │                                 │
+                    │   N_DSB ~ Poisson(κ × D)        │
+                    │   κ = 40 DSB/Gy                 │
+                    │                                 │
+                    │   Example:                      │
+                    │   D = 2 Gy → N_DSB ≈ 80 DSB     │
+                    │   D = 4 Gy → N_DSB ≈ 160 DSB    │
+                    └─────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │   STEP 1b: Convert to Energy    │
+                    │                                 │
+                    │   E_cur = α × N_DSB             │
+                    │   α = 0.529                     │
+                    │                                 │
+                    │   Example:                      │
+                    │   N_DSB = 80 → E = 42.3         │
+                    │   N_DSB = 160 → E = 84.6        │
+                    └─────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────┐
+                    │   STEP 1c: Compare to Thresholds│
+                    │                                 │
+                    │   E1 = 0.0   (Healthy)          │
+                    │   E2 = 36.23 (Repair threshold) │
+                    │   E3 = 69.49 (Death threshold)  │
+                    │                                 │
+                    │   IF E < E2: Likely stay S1     │
+                    │   IF E2 < E < E3: Likely → S2   │
+                    │   IF E > E3: High risk → S3     │
+                    └─────────────────────────────────┘
+
+================================================================================
+STEP 2: CALCULATE TRANSITION PROBABILITIES (S1 STATE)
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 2a: State Overlap Probabilities  │
+                    │                                         │
+                    │   PS1→S2 = 2 × Φ(-|E_cur - E2| / 2σ)   │
+                    │          = 2 × Φ(-|E_cur - 36.23| / 20) │
+                    │                                         │
+                    │   PS1→S3 = 2 × Φ(-|E_cur - E3| / 2σ)   │
+                    │          = 2 × Φ(-|E_cur - 69.49| / 20) │
+                    │                                         │
+                    │   where Φ = Standard Normal CDF         │
+                    └─────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 2b: Per-Step Jump Probabilities  │
+                    │                                         │
+                    │   IF new damage (DSB > 0):              │
+                    │      p12 = InstantaneousJumpProb(       │
+                    │               PS1→S2, dt, T12)          │
+                    │      p13 = InstantaneousJumpProb(       │
+                    │               PS1→S3, dt, T13)          │
+                    │                                         │
+                    │   ELSE (no new damage):                 │
+                    │      p12 = DelayedJumpProb(             │
+                    │               PS1→S2, dt, T12)          │
+                    │      p13 = DelayedJumpProb(             │
+                    │               PS1→S3, dt, T13)          │
+                    │                                         │
+                    │   T12 = T13 = 10.0 hours                │
+                    │   dt = 60 seconds (time step)           │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+STEP 3: S1 STATE TRANSITION DECISION
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 3: Random Transition Decision    │
+                    │                                         │
+                    │   u = UniformRandom(0, 1)               │
+                    └─────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+                    ▼              ▼              ▼
+         ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+         │ IF u < p13   │  │ ELIF u <     │  │ ELSE         │
+         │              │  │ p13 + p12    │  │              │
+         │   ──────>    │  │   ──────>    │  │   ──────>    │
+         │              │  │              │  │              │
+         │  S3 (DEATH)  │  │  S2 (REPAIR) │  │  Stay in S1  │
+         │  [ABSORBING] │  │              │  │  Continue    │
+         └──────────────┘  └──────────────┘  └──────────────┘
+                │                  │                  │
+                │                  │                  │
+                ▼                  ▼                  ▼
+         ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+         │ Cell dies    │  │ Go to S2     │  │ Increment    │
+         │ immediately  │  │ flow         │  │ age, repeat  │
+         │ End of sim   │  │ (see below)  │  │ next step    │
+         └──────────────┘  └──────────────┘  └──────────────┘
+
+================================================================================
+STEP 4: S2 STATE (REPAIR STATE) - ENTRY
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STATE S2: REPAIR STATE                │
+                    │                                         │
+                    │   Cell entered S2 due to damage         │
+                    │   Energy: E_cur (from damage)           │
+                    │   Non-clonogenic (cannot form colonies) │
+                    │                                         │
+                    │   Two competing processes:              │
+                    │   1. REPAIR → return to S1              │
+                    │   2. DEATH  → progress to S3            │
+                    └─────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │   DNA REPAIR PROCESS (Background)       │
+                    │                                         │
+                    │   Two-component exponential repair:     │
+                    │   - Fast: f1=0.62, λ1=0.331 h⁻¹        │
+                    │   - Slow: f2=0.38, λ2=0.014 h⁻¹        │
+                    │                                         │
+                    │   N_DSB(t) = N_0 × [f1×e^(-λ1×t) +     │
+                    │                     f2×e^(-λ2×t)]       │
+                    │                                         │
+                    │   E_cur(t) = α × N_DSB(t)               │
+                    │   → Energy decays as DSBs are repaired  │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+STEP 5: S2 STATE - CALCULATE TRANSITION PROBABILITIES
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 5a: Repair Probability (S2→S1)   │
+                    │                                         │
+                    │   PS2→S1 = 2 × Φ(-|E_cur - E1| / 2σ)   │
+                    │          = 2 × Φ(-|E_cur - 0| / 20)     │
+                    │          = 2 × Φ(-E_cur / 20)           │
+                    │                                         │
+                    │   As E_cur decreases (repair):          │
+                    │   → PS2→S1 INCREASES                    │
+                    │   → Repair becomes more likely          │
+                    └─────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 5b: Death Probability (S2→S3)    │
+                    │                                         │
+                    │   PS2→S3 = 2 × Φ(-|E_cur - E3| / 2σ)   │
+                    │          = 2 × Φ(-|E_cur - 69.49| / 20) │
+                    │                                         │
+                    │   As E_cur decreases (repair):          │
+                    │   → PS2→S3 DECREASES                    │
+                    │   → Death becomes less likely           │
+                    │                                         │
+                    │   SOFT SATURATION CHECK:                │
+                    │   IF E_cur >= E3 + margin×σ:            │
+                    │      PS2→S3 = 1.0 (certain death)       │
+                    │      (margin = 1.0, so E3 + 1σ = 79.49) │
+                    └─────────────────────────────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 5c: Per-Step Probabilities       │
+                    │                                         │
+                    │   p21 = DelayedJumpProb(PS2→S1, dt, T21)│
+                    │   p23 = DelayedJumpProb(PS2→S3, dt, T23)│
+                    │                                         │
+                    │   T21 = T23 = 10.0 hours                │
+                    │                                         │
+                    │   Normalize if needed:                  │
+                    │   IF (p21 + p23) > 1.0:                 │
+                    │      p21 /= (p21 + p23)                 │
+                    │      p23 /= (p21 + p23)                 │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+STEP 6: S2 STATE - CHECKPOINT MODIFICATION (IF ENABLED)
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   CHECKPOINT MECHANISM (Original Design)│
+                    │                                         │
+                    │   IF checkpoint hold is active:         │
+                    │   ┌─────────────────────────────────┐   │
+                    │   │ BLOCK S2→S3 transition          │   │
+                    │   │ p23 = 0 (during hold period)    │   │
+                    │   │                                  │   │
+                    │   │ ALLOW S2→S1 transition          │   │
+                    │   │ p21 = normal (not blocked)      │   │
+                    │   │                                  │   │
+                    │   │ Increment hold age              │   │
+                    │   │ After T_hold expires: allow p23 │   │
+                    │   └─────────────────────────────────┘   │
+                    │                                         │
+                    │   Effect: Gives cell time to repair     │
+                    │   before death can occur                │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+STEP 7: S2 STATE - TRANSITION DECISION
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STEP 7: Random Transition Decision    │
+                    │                                         │
+                    │   u = UniformRandom(0, 1)               │
+                    └─────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    │              │              │
+                    ▼              ▼              ▼
+         ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+         │ IF u < p23   │  │ ELIF u <     │  │ ELSE         │
+         │              │  │ p23 + p21    │  │              │
+         │   ──────>    │  │   ──────>    │  │   ──────>    │
+         │              │  │              │  │              │
+         │  S3 (DEATH)  │  │  S1 (REPAIR) │  │  Stay in S2  │
+         │  [ABSORBING] │  │  [SUCCESS]   │  │  Continue    │
+         └──────────────┘  └──────────────┘  └──────────────┘
+                │                  │                  │
+                │                  │                  │
+                ▼                  ▼                  ▼
+         ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+         │ Cell dies    │  │ Cell returns │  │ Continue     │
+         │ Remove from  │  │ to healthy   │  │ repair       │
+         │ simulation   │  │ state        │  │ E_cur decays │
+         │              │  │ Clonogenic   │  │ Increment age│
+         │ Clean up     │  │ again        │  │              │
+         │ checkpoint   │  │              │  │ Repeat step 5│
+         └──────────────┘  └──────────────┘  └──────────────┘
+
+================================================================================
+STEP 8: S3 STATE (DEATH) - ABSORBING STATE
+================================================================================
+
+                    ┌─────────────────────────────────────────┐
+                    │   STATE S3: DEATH (ABSORBING)           │
+                    │                                         │
+                    │   - No transitions out of S3            │
+                    │   - Cell is permanently dead            │
+                    │   - Removed from active simulation      │
+                    │   - Contributes to death count          │
+                    │                                         │
+                    │   Cell fate: DEAD                       │
+                    └─────────────────────────────────────────┘
+
+================================================================================
+KEY ASYMMETRY: WHY REPAIR CAN WIN
+================================================================================
+
+    TIME EVOLUTION IN S2 STATE:
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │                                                             │
+    │  EARLY in S2 (high damage, E_cur >> E3):                    │
+    │  ┌─────────────────────────────────────────┐              │
+    │  │ PS2→S3 HIGH (close to E3)               │              │
+    │  │ PS2→S1 LOW (far from E1=0)              │              │
+    │  │                                          │              │
+    │  │ p23 >> p21                               │              │
+    │  │ → Death is favored                       │              │
+    │  └─────────────────────────────────────────┘              │
+    │                                                             │
+    │  LATER in S2 (after repair, E_cur decreases):              │
+    │  ┌─────────────────────────────────────────┐              │
+    │  │ PS2→S3 LOW (further from E3)            │              │
+    │  │ PS2→S1 HIGH (closer to E1=0)            │              │
+    │  │                                          │              │
+    │  │ p21 >> p23                               │              │
+    │  │ → Repair is favored                      │              │
+    │  └─────────────────────────────────────────┘              │
+    │                                                             │
+    │  KEY INSIGHT:                                               │
+    │  - DNA repair reduces E_cur over time                       │
+    │  - As E_cur drops, repair probability increases             │
+    │  - Cells that survive initial phase tend to repair          │
+    │                                                             │
+    └─────────────────────────────────────────────────────────────┘
+
+    EXAMPLE: Initial E_cur = 84 (4 Gy exposure)
+
+    Time: 0h          Time: 2h          Time: 5h          Time: 10h
+    ┌──────────┐      ┌──────────┐      ┌──────────┐      ┌──────────┐
+    │ E_cur=84 │      │ E_cur=75 │      │ E_cur=60 │      │ E_cur=45 │
+    │          │      │          │      │          │      │          │
+    │ E > E3   │      │ E > E3   │      │ E < E3   │      │ E < E2   │
+    │ (69.49)  │      │ (69.49)  │      │ (69.49)  │      │ (36.23)  │
+    └──────────┘      └──────────┘      └──────────┘      └──────────┘
+         │                │                │                │
+         ▼                ▼                ▼                ▼
+    PS2→S3=0.77      PS2→S3=0.63      PS2→S3=0.32      PS2→S3=0.12
+    PS2→S1=0.07      PS2→S1=0.10      PS2→S1=0.17      PS2→S1=0.32
+
+    Death dominates    Still risky       Turning point    Repair dominates
+
+================================================================================
+DSB AND DOSE THRESHOLDS
+================================================================================
+
+    Energy → DSB → Dose conversion:
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                                                              │
+    │  THRESHOLD E1 = 0.0 (Healthy Baseline)                       │
+    │  ├── DSB threshold: 0 DSB                                   │
+    │  └── Dose threshold: 0 Gy                                   │
+    │                                                              │
+    │  THRESHOLD E2 = 36.23 (Repair Threshold)                     │
+    │  ├── DSB threshold: E2/α = 36.23/0.529 = 68.5 DSB           │
+    │  └── Dose threshold: 68.5/κ = 68.5/40 = 1.71 Gy             │
+    │      → Above this: high probability of entering S2          │
+    │                                                              │
+    │  THRESHOLD E3 = 69.49 (Death Threshold)                      │
+    │  ├── DSB threshold: E3/α = 69.49/0.529 = 131.3 DSB          │
+    │  └── Dose threshold: 131.3/κ = 131.3/40 = 3.28 Gy           │
+    │      → Above this: high probability of direct death         │
+    │                                                              │
+    │  SOFT SATURATION: E3 + 1σ = 79.49 (margin=1.0 default)      │
+    │  ├── DSB threshold: 99.49/0.529 = 188.0 DSB                 │
+    │  └── Dose threshold: 188.0/40 = 4.70 Gy                     │
+    │      → Above this: certain death (PS2→S3 = 1.0)             │
+    │                                                              │
+    └──────────────────────────────────────────────────────────────┘
+
+================================================================================
+SURVIVAL FRACTION CALCULATION
+================================================================================
+
+    At end of simulation (T = 27.8 hours):
+
+    ┌─────────────────────────────────────────────────────────────┐
+    │   COLONY FORMATION ASSAY                                    │
+    │                                                             │
+    │   1. Count cells in each state:                             │
+    │      - N_S1 = cells in S1 (healthy)                        │
+    │      - N_S2 = cells in S2 (repair, non-clonogenic)         │
+    │      - N_S3 = cells in S3 (dead)                           │
+    │                                                             │
+    │   2. Group S1 cells by ancestry (clonal lineage)           │
+    │                                                             │
+    │   3. Count colonies with size >= 4 cells                   │
+    │      (Standard colony formation criterion)                  │
+    │                                                             │
+    │   4. Survival Fraction:                                     │
+    │      SF = (Number of colonies) / (Initial cell number)     │
+    │                                                             │
+    │   NOTE: S2 cells do NOT contribute to SF                   │
+    │   (they are alive but non-clonogenic)                      │
+    │                                                             │
+    └─────────────────────────────────────────────────────────────┘
+
+================================================================================
+SIMULATION RESULTS SUMMARY (5 REPLICATES)
+================================================================================
+
+    Dose (Gy)    SF_LQ       SF_Simulated    Error
+    ─────────────────────────────────────────────────
+    0.0          1.0000      0.8874 ± 0.008   11.3%
+    0.5          0.6686      0.6972 ± 0.010    4.3%
+    1.0          0.4232      0.3778 ± 0.015   10.7%
+    1.5          0.2535      0.2010 ± 0.018   20.7%
+    2.0          0.1437      0.1018 ± 0.007   29.2%
+    2.5          0.0771      0.0508 ± 0.008   34.1%
+    3.0          0.0392      0.0164 ± 0.003   58.1%
+    4.0          0.0086      0.0034 ± 0.001    —
+    5.0          0.0015      0.0000 ± 0.000    —
+    6.0          0.0002      0.0002 ± 0.000    —
+    ─────────────────────────────────────────────────
+    Average Error: 24.1%
+
+================================================================================
+COMPLETE FLOW SUMMARY
+================================================================================
+
+    ┌──────────┐    Dose D    ┌──────────────────┐
+    │  START   │────────────> │ Calculate DSB    │
+    └──────────┘              │ N = κD ≈ 40×D    │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                              ┌──────────────────┐
+                              │ Calculate Energy │
+                              │ E = αN ≈ 0.529×N │
+                              └────────┬─────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+              E < E2 (36)        E2 < E < E3       E > E3 (69)
+              Low damage        Medium damage      High damage
+                    │                  │                  │
+                    ▼                  ▼                  ▼
+              ┌──────────┐      ┌──────────┐      ┌──────────┐
+              │ Stay S1  │      │ S1 → S2  │      │ S1 → S3  │
+              │ Survive  │      │ (Repair) │      │ (Death)  │
+              └──────────┘      └────┬─────┘      └──────────┘
+                    │                │
+                    │    ┌───────────┴───────────┐
+                    │    │                       │
+                    │    ▼                       ▼
+                    │  Repair               Death
+                    │  (p21)                (p23)
+                    │    │                       │
+                    │    ▼                       ▼
+                    │  ┌──────────┐       ┌──────────┐
+                    │  │ S2 → S1  │       │ S2 → S3  │
+                    │  │ (Return) │       │ (Die)    │
+                    │  └────┬─────┘       └──────────┘
+                    │       │
+                    └───────┴──────────────┐
+                                           │
+                                           ▼
+                                    ┌──────────────┐
+                                    │   END SIM    │
+                                    │   Count SF   │
+                                    └──────────────┘
+
+================================================================================
+END OF FLOW DIAGRAM
+================================================================================
+
