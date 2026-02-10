@@ -251,6 +251,15 @@ class PIDEExplorerGUI:
         self.pide_dir = pide_dir
         self.data_manager = PIDEDataManager(pide_dir)
         self.current_experiments = pd.DataFrame()
+        # Track plotted elements for highlighting
+        self.plot_elements = {}
+        self.selected_exp_id = None
+        self.highlight_annotation = None
+        self.temp_highlight_elements = []  # Temporary elements created during highlighting
+        # Track fitted parameters for annotation
+        self.params_fitted = False
+        self.fitted_alpha = None
+        self.fitted_beta = None
         
         # Variables for checkboxes
         self.show_raw_var = tk.BooleanVar(value=True)
@@ -426,7 +435,7 @@ class PIDEExplorerGUI:
         table_frame.pack(fill=tk.X, pady=5)
         
         # Create treeview for experiment table
-        columns = ('ExpID', 'Cell', 'Publication', 'LET', 'Energy', 'Alpha', 'Beta', 'D10', 'HasRaw')
+        columns = ('ExpID', 'Cell', 'Publication', 'LET', 'Energy', 'Alpha', 'Beta', 'D10', 'PhotonRef', 'HasRaw')
         self.tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=8)
         
         # Column headings
@@ -438,18 +447,23 @@ class PIDEExplorerGUI:
         self.tree.heading('Alpha', text='α (Gy⁻¹)')
         self.tree.heading('Beta', text='β (Gy⁻²)')
         self.tree.heading('D10', text='D10 (Gy)')
+        self.tree.heading('PhotonRef', text='Photon Ref')
         self.tree.heading('HasRaw', text='Raw Data')
         
         # Column widths
         self.tree.column('ExpID', width=50)
         self.tree.column('Cell', width=70)
-        self.tree.column('Publication', width=100)
-        self.tree.column('LET', width=80)
-        self.tree.column('Energy', width=80)
-        self.tree.column('Alpha', width=70)
-        self.tree.column('Beta', width=70)
-        self.tree.column('D10', width=70)
-        self.tree.column('HasRaw', width=60)
+        self.tree.column('Publication', width=80)
+        self.tree.column('LET', width=70)
+        self.tree.column('Energy', width=70)
+        self.tree.column('Alpha', width=60)
+        self.tree.column('Beta', width=60)
+        self.tree.column('D10', width=60)
+        self.tree.column('PhotonRef', width=70)
+        self.tree.column('HasRaw', width=55)
+        
+        # Bind selection event
+        self.tree.bind('<<TreeviewSelect>>', self.on_table_select)
         
         # Scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -462,6 +476,9 @@ class PIDEExplorerGUI:
         self.status_var = tk.StringVar(value='Ready')
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief=tk.SUNKEN)
         status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        
+        # Keyboard shortcuts
+        self.root.bind('<Escape>', lambda e: self.clear_highlight())
     
     def setup_plot(self):
         """Initialize plot settings"""
@@ -669,6 +686,320 @@ class PIDEExplorerGUI:
     def on_photon_cell_filter_changed(self, event):
         """Handle cell filter change (Mode 3)"""
         self.update_plot_mode3()
+
+    def on_table_select(self, event):
+        """Handle table row selection - highlight corresponding curve"""
+        selection = self.tree.selection()
+        if not selection:
+            self.clear_highlight()
+            return
+
+        item = self.tree.item(selection[0])
+        if not item.get('values'):
+            self.clear_highlight()
+            return
+
+        exp_id = int(item['values'][0])
+        self.highlight_experiment(exp_id)
+
+    def highlight_experiment(self, exp_id):
+        """Highlight the curve for a specific experiment
+        
+        Always shows both big dots AND thick solid line for the selected experiment,
+        creating temporary elements if the original data only had one or the other.
+        """
+        self.selected_exp_id = exp_id
+        
+        # Remove any temporary highlight elements from previous selection
+        for artist in self.temp_highlight_elements:
+            try:
+                artist.remove()
+            except:
+                pass
+        self.temp_highlight_elements = []
+        
+        # Get the selected experiment data for creating temporary elements
+        exp_data = self.current_experiments[self.current_experiments['ExpID'] == exp_id]
+        exp_row = exp_data.iloc[0] if not exp_data.empty else None
+
+        for eid, elements in self.plot_elements.items():
+            is_selected = (eid == exp_id)
+
+            scatter_artist = elements.get('scatter')
+            line_artist = elements.get('line')
+            
+            if scatter_artist is not None:
+                scatter_artist.set_alpha(1.0 if is_selected else 0.15)
+                scatter_artist.set_sizes([120 if is_selected else 50])
+                if is_selected:
+                    scatter_artist.set_edgecolors('black')
+                    scatter_artist.set_linewidths(2)
+                else:
+                    scatter_artist.set_edgecolors('none')
+                    scatter_artist.set_linewidths(0)
+
+            if line_artist is not None:
+                line_artist.set_alpha(1.0 if is_selected else 0.15)
+                line_artist.set_linewidth(4 if is_selected else 1.5)
+                if is_selected:
+                    line_artist.set_linestyle('-')  # Always solid when selected
+            
+            # For the selected experiment, create missing elements
+            if is_selected and exp_row is not None:
+                color = scatter_artist.get_facecolors()[0] if scatter_artist is not None else \
+                        (line_artist.get_color() if line_artist is not None else 'blue')
+                
+                # Determine parameter mode based on current selection mode
+                current_mode = self.selection_mode.get()
+                param_mode = 'photon' if current_mode == 'photon' else 'ion'
+                
+                # Get LQ parameters and check if complete (both alpha AND beta reported)
+                alpha_val, beta_val = self._get_lq_params(exp_row, mode=param_mode)
+                # Parameters are complete only if both are reported (beta_val != 0 means it was actually reported)
+                params_complete = (alpha_val is not None) and (beta_val is not None and beta_val != 0)
+                self.params_fitted = False
+                self.fitted_alpha = None
+                self.fitted_beta = None
+                
+                # If parameters incomplete but have raw data, fit the model
+                if not params_complete and scatter_artist is not None:
+                    offsets = scatter_artist.get_offsets()
+                    doses_raw = offsets[:, 0]
+                    sf_raw = offsets[:, 1]
+                    fitted_alpha, fitted_beta = self._fit_lq_model(doses_raw, sf_raw)
+                    if fitted_alpha is not None:
+                        alpha_val = fitted_alpha
+                        beta_val = fitted_beta
+                        self.params_fitted = True
+                        self.fitted_alpha = fitted_alpha
+                        self.fitted_beta = fitted_beta
+                
+                # If we fitted parameters, hide existing line and create new fitted line
+                if self.params_fitted and alpha_val is not None:
+                    # Hide existing line if present (will be restored on clear)
+                    if line_artist is not None:
+                        line_artist.set_alpha(0)
+                    # Create temporary line with fitted parameters
+                    doses = np.linspace(0, 12, 100)
+                    sf = np.exp(-alpha_val * doses - beta_val * doses**2)
+                    temp_line, = self.ax.plot(
+                        doses, sf, color=color, linestyle='-',
+                        linewidth=4, alpha=1.0, zorder=10
+                    )
+                    self.temp_highlight_elements.append(temp_line)
+                elif line_artist is None and alpha_val is not None:
+                    # No existing line, create temporary line from LQ parameters
+                    doses = np.linspace(0, 12, 100)
+                    sf = np.exp(-alpha_val * doses - beta_val * doses**2)
+                    temp_line, = self.ax.plot(
+                        doses, sf, color=color, linestyle='-',
+                        linewidth=4, alpha=1.0, zorder=10
+                    )
+                    self.temp_highlight_elements.append(temp_line)
+                
+                # If no scatter exists but we have line, create temporary dots
+                if scatter_artist is None and line_artist is not None:
+                    # Get points from the line data
+                    line_x = line_artist.get_xdata()
+                    line_y = line_artist.get_ydata()
+                    # Sample key points (0, 2, 4, 6, 8, 10 Gy)
+                    key_doses = [0, 2, 4, 6, 8, 10]
+                    key_sf = []
+                    for d in key_doses:
+                        idx = int(d / 12 * (len(line_x) - 1))
+                        key_sf.append(line_y[idx])
+                    temp_scatter = self.ax.scatter(
+                        key_doses, key_sf,
+                        color=color, s=120, alpha=1.0, zorder=10,
+                        edgecolors='black', linewidths=2
+                    )
+                    self.temp_highlight_elements.append(temp_scatter)
+
+        self.add_highlight_annotation(exp_id)
+        self.canvas.draw()
+    
+    def _get_lq_params(self, exp_row, mode='ion'):
+        """Get consistent alpha/beta parameters for LQ model.
+        
+        Args:
+            exp_row: DataFrame row with experiment data
+            mode: 'ion' or 'photon' - determines which parameter set to use
+        
+        Returns:
+            (alpha, beta) tuple. If beta is N/A, returns 0 for beta.
+            Returns (None, None) if no parameters available.
+        """
+        if mode == 'ion':
+            # Use ion parameters (ai_paper, bi_paper)
+            if pd.notna(exp_row.get('ai_paper')):
+                alpha = exp_row['ai_paper']
+                beta = exp_row.get('bi_paper') if pd.notna(exp_row.get('bi_paper')) else 0
+                return alpha, beta
+            # Fallback to fitted ion parameters
+            if pd.notna(exp_row.get('ai_fit')):
+                alpha = exp_row['ai_fit']
+                beta = exp_row.get('bi_fit') if pd.notna(exp_row.get('bi_fit')) else 0
+                return alpha, beta
+        else:  # mode == 'photon'
+            # Use photon parameters (ax_paper, bx_paper)
+            if pd.notna(exp_row.get('ax_paper')):
+                alpha = exp_row['ax_paper']
+                beta = exp_row.get('bx_paper') if pd.notna(exp_row.get('bx_paper')) else 0
+                return alpha, beta
+            # Fallback to fitted photon parameters
+            if pd.notna(exp_row.get('ax_fit')):
+                alpha = exp_row['ax_fit']
+                beta = exp_row.get('bx_fit') if pd.notna(exp_row.get('bx_fit')) else 0
+                return alpha, beta
+        
+        return None, None
+    
+    def _fit_lq_model(self, doses, sf_values):
+        """Fit LQ model to raw survival data using numpy linear algebra.
+        
+        Model: SF = exp(-alpha*D - beta*D^2)
+        Taking ln: ln(SF) = -alpha*D - beta*D^2
+        This is linear in alpha and beta, solvable via least squares.
+        
+        Args:
+            doses: array of dose values (Gy)
+            sf_values: array of survival fraction values
+        
+        Returns:
+            (alpha, beta) tuple, or (None, None) if fitting fails
+        """
+        try:
+            # Filter out any invalid values (D >= 0, SF > 0 for log)
+            doses_arr = np.array(doses)
+            sf_arr = np.array(sf_values)
+            valid_mask = (doses_arr >= 0) & (sf_arr > 0)
+            doses_valid = doses_arr[valid_mask]
+            sf_valid = sf_arr[valid_mask]
+            
+            if len(doses_valid) < 2:
+                return None, None
+            
+            # Transform to linear problem: ln(SF) = -alpha*D - beta*D^2
+            # Let y = ln(SF), x1 = D, x2 = D^2
+            # Then y = -alpha*x1 - beta*x2
+            y = np.log(sf_valid)
+            X = np.column_stack([doses_valid, doses_valid**2])
+            
+            # Solve using least squares: X @ params = y
+            # params = [−alpha, −beta]
+            params, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
+            alpha = -params[0]
+            beta = -params[1]
+            
+            # Ensure non-negative values (physically meaningful)
+            alpha = max(0, alpha)
+            beta = max(0, beta)
+            
+            return alpha, beta
+        except:
+            return None, None
+
+    def add_highlight_annotation(self, exp_id):
+        """Add text annotation for highlighted experiment"""
+        if self.highlight_annotation:
+            self.highlight_annotation.remove()
+            self.highlight_annotation = None
+
+        exp = self.current_experiments[self.current_experiments['ExpID'] == exp_id]
+        if exp.empty:
+            return
+
+        exp = exp.iloc[0]
+        cell = exp['Cells']
+        
+        # Check if we used curve-fitted parameters (fitted to raw data during highlight)
+        if hasattr(self, 'params_fitted') and self.params_fitted:
+            # Use fitted parameters
+            alpha = self.fitted_alpha
+            beta = self.fitted_beta
+            text = f"ExpID: {exp_id}\nCell: {cell}"
+            text += f"\nα={alpha:.4f}, β={beta:.5f}"
+            text += "\n(curve fitted)"
+        else:
+            # Track source of parameters
+            source = None
+            
+            # Use ion parameters if available (ai_paper first, then ai_fit)
+            if pd.notna(exp.get('ai_paper')):
+                alpha = exp['ai_paper']
+                beta = exp.get('bi_paper')
+                source = 'paper'
+            elif pd.notna(exp.get('ai_fit')):
+                alpha = exp['ai_fit']
+                beta = exp.get('bi_fit')
+                source = 'fit'
+            # Otherwise try photon parameters (ax_paper first, then ax_fit)
+            elif pd.notna(exp.get('ax_paper')):
+                alpha = exp['ax_paper']
+                beta = exp.get('bx_paper')
+                source = 'paper'
+            elif pd.notna(exp.get('ax_fit')):
+                alpha = exp['ax_fit']
+                beta = exp.get('bx_fit')
+                source = 'fit'
+            else:
+                alpha = None
+                beta = None
+                source = None
+
+            text = f"ExpID: {exp_id}\nCell: {cell}"
+            if pd.notna(alpha):
+                text += f"\nα={alpha:.4f}"
+                if pd.notna(beta):
+                    text += f", β={beta:.5f}"
+                if source == 'fit':
+                    text += "\n(from fit)"
+
+        self.highlight_annotation = self.ax.annotate(
+            text,
+            xy=(0.98, 0.98),
+            xycoords='axes fraction',
+            ha='right',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.9, edgecolor='black')
+        )
+
+    def clear_highlight(self):
+        """Clear any existing highlight and remove temporary elements"""
+        # Remove temporary highlight elements
+        for artist in self.temp_highlight_elements:
+            try:
+                artist.remove()
+            except:
+                pass
+        self.temp_highlight_elements = []
+        
+        # Reset fitted parameters flag
+        self.params_fitted = False
+        self.fitted_alpha = None
+        self.fitted_beta = None
+        
+        # Restore original styling for all plot elements
+        for elements in self.plot_elements.values():
+            scatter_artist = elements.get('scatter')
+            if scatter_artist is not None:
+                scatter_artist.set_alpha(0.8)
+                scatter_artist.set_sizes([50])
+                scatter_artist.set_edgecolors('none')
+                scatter_artist.set_linewidths(0)
+
+            line_artist = elements.get('line')
+            if line_artist is not None:
+                line_artist.set_alpha(0.7)
+                line_artist.set_linewidth(1.5)
+
+        if self.highlight_annotation:
+            self.highlight_annotation.remove()
+            self.highlight_annotation = None
+
+        self.selected_exp_id = None
+        self.canvas.draw()
     
     def update_plot_mode3(self):
         """Update plot for Mode 3 (Photon Type)"""
@@ -679,20 +1010,33 @@ class PIDEExplorerGUI:
             return
         
         # Get experiments
-        self.current_experiments = self.data_manager.get_experiments_by_photon(
+        experiments = self.data_manager.get_experiments_by_photon(
             photon_type, cell_filter if cell_filter != 'All' else None)
+        
+        # Filter to unique photon references only
+        # Keep first experiment for each (PublicationID, PhotonExpNum) combination
+        # that has actual raw data
+        seen_refs = set()
+        unique_experiments = []
+        for _, exp in experiments.iterrows():
+            pub_id = exp['PublicationID']
+            photon_exp = int(exp['PhotonExpNum']) if pd.notna(exp['PhotonExpNum']) else 0
+            ref_key = (pub_id, photon_exp)
+            # Only include if we haven't seen this ref AND it has raw data
+            if ref_key not in seen_refs:
+                if self.data_manager.get_photon_raw_data(pub_id, photon_exp) is not None:
+                    seen_refs.add(ref_key)
+                    unique_experiments.append(exp)
+        
+        self.current_experiments = pd.DataFrame(unique_experiments)
         
         # Update statistics
         n_exp = len(self.current_experiments)
-        n_raw = sum(1 for _, exp in self.current_experiments.iterrows() 
-                   if self.data_manager.get_photon_raw_data(exp['PublicationID'], exp['PhotonExpNum']) is not None)
-        
         cells_in_results = self.current_experiments['Cells'].unique() if not self.current_experiments.empty else []
         
         self.stats_label.config(text=
             f'Photon: {photon_type}\n'
-            f'Experiments: {n_exp}\n'
-            f'With raw data: {n_raw}\n'
+            f'Unique curves: {n_exp}\n'
             f'Cell lines: {len(cells_in_results)}'
         )
         
@@ -702,11 +1046,19 @@ class PIDEExplorerGUI:
         # Update plot
         self.plot_survival_data_mode3()
         
-        self.status_var.set(f'Displaying {n_exp} experiments for {photon_type} photons')
+        self.status_var.set(f'Displaying {n_exp} unique photon curves for {photon_type}')
     
     def plot_survival_data_mode3(self):
-        """Plot survival curves for Mode 3 (Photon radiation)"""
+        """Plot survival curves for Mode 3 (Photon radiation)
+        
+        Note: In photon mode, multiple experiments may share the same photon reference data
+        (same PublicationID + PhotonExpNum). Each unique photon reference is plotted once,
+        and all experiments sharing that reference are linked to the same plot element.
+        """
         self.ax.clear()
+        self.plot_elements = {}
+        self.selected_exp_id = None
+        self.highlight_annotation = None
         
         experiments = self.current_experiments
         
@@ -727,21 +1079,21 @@ class PIDEExplorerGUI:
         show_lq = self.show_lq_var.get()
         
         plotted_cells = set()
-        
-        # Group by publication and photon exp to avoid duplicate plotting
-        seen_photon_exps = set()
+        plotted_photon_refs = {}  # {(pub_id, photon_exp): {'scatter': artist, 'line': artist}}
         
         for idx, (_, exp) in enumerate(experiments.iterrows()):
+            exp_id = exp['ExpID']
             cell = exp['Cells']
             pub_id = exp['PublicationID']
-            photon_exp = exp['PhotonExpNum']
+            photon_exp = int(exp['PhotonExpNum']) if pd.notna(exp['PhotonExpNum']) else 0
+            photon_ref_key = (pub_id, photon_exp)
             color = cell_color_map.get(cell, 'blue')
             
-            # Skip if we've already plotted this photon experiment
-            key = (pub_id, photon_exp, cell)
-            if key in seen_photon_exps:
+            # Check if this photon reference was already plotted
+            if photon_ref_key in plotted_photon_refs:
+                # Link this experiment to existing plot elements
+                self.plot_elements[exp_id] = plotted_photon_refs[photon_ref_key].copy()
                 continue
-            seen_photon_exps.add(key)
             
             # Get photon raw data
             raw_data = self.data_manager.get_photon_raw_data(pub_id, photon_exp)
@@ -751,17 +1103,28 @@ class PIDEExplorerGUI:
             label_raw = f'{cell}' if cell not in plotted_cells else None
             label_lq = None
             
+            # Initialize storage for this photon reference
+            plotted_photon_refs[photon_ref_key] = {}
+            
             # Plot raw data points
             if show_raw and has_raw:
-                self.ax.scatter(raw_data['doses'], raw_data['sf'], 
-                               color=color, s=50, alpha=0.8, zorder=3,
-                               label=label_raw)
+                scatter_artist = self.ax.scatter(
+                    raw_data['doses'], raw_data['sf'],
+                    color=color, s=50, alpha=0.8, zorder=3,
+                    label=label_raw
+                )
+                plotted_photon_refs[photon_ref_key]['scatter'] = scatter_artist
+                self.plot_elements.setdefault(exp_id, {})['scatter'] = scatter_artist
                 plotted_cells.add(cell)
             
-            # Plot LQ curve using photon parameters (ax_paper, bx_paper)
-            if show_lq and pd.notna(exp['ax_paper']):
-                alpha = exp['ax_paper']
-                beta = exp['bx_paper'] if pd.notna(exp['bx_paper']) else 0
+            # Plot LQ curve using photon parameters (ax_paper or ax_fit)
+            # Try ax_paper first, then fall back to ax_fit
+            alpha_val = exp['ax_paper'] if pd.notna(exp['ax_paper']) else exp.get('ax_fit')
+            beta_col = 'bx_paper' if pd.notna(exp['ax_paper']) else 'bx_fit'
+            
+            if show_lq and pd.notna(alpha_val):
+                alpha = alpha_val
+                beta = exp[beta_col] if pd.notna(exp.get(beta_col)) else 0
                 
                 doses = np.linspace(0, 12, 100)
                 sf = np.exp(-(alpha * doses + beta * doses**2))
@@ -774,8 +1137,13 @@ class PIDEExplorerGUI:
                     label_lq = f'{cell}'
                     plotted_cells.add(cell)
                 
-                self.ax.plot(doses, sf, color=color, linestyle=linestyle, 
-                            linewidth=linewidth, alpha=0.7, zorder=2, label=label_lq)
+                line_artist, = self.ax.plot(
+                    doses, sf, color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=0.7, zorder=2, label=label_lq
+                )
+                plotted_photon_refs[photon_ref_key]['line'] = line_artist
+                self.plot_elements.setdefault(exp_id, {})['line'] = line_artist
+
         
         # Set up axes
         self.ax.set_xlabel('Dose (Gy)', fontsize=12)
@@ -844,6 +1212,9 @@ class PIDEExplorerGUI:
     def plot_survival_data_mode2(self):
         """Plot survival curves for Mode 2 (grouped by cell line instead of LET)"""
         self.ax.clear()
+        self.plot_elements = {}
+        self.selected_exp_id = None
+        self.highlight_annotation = None
         
         experiments = self.current_experiments
         
@@ -881,9 +1252,12 @@ class PIDEExplorerGUI:
             
             # Plot raw data points
             if show_raw and has_raw:
-                self.ax.scatter(raw_data['doses'], raw_data['sf'], 
-                               color=color, s=50, alpha=0.8, zorder=3,
-                               label=label_raw)
+                scatter_artist = self.ax.scatter(
+                    raw_data['doses'], raw_data['sf'],
+                    color=color, s=50, alpha=0.8, zorder=3,
+                    label=label_raw
+                )
+                self.plot_elements.setdefault(exp_id, {})['scatter'] = scatter_artist
                 plotted_cells.add(cell)
             
             # Plot LQ curve
@@ -902,8 +1276,11 @@ class PIDEExplorerGUI:
                     label_lq = f'{cell} (LET={let:.1f})'
                     plotted_cells.add(cell)
                 
-                self.ax.plot(doses, sf, color=color, linestyle=linestyle, 
-                            linewidth=linewidth, alpha=0.7, zorder=2, label=label_lq)
+                line_artist, = self.ax.plot(
+                    doses, sf, color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=0.7, zorder=2, label=label_lq
+                )
+                self.plot_elements.setdefault(exp_id, {})['line'] = line_artist
         
         # Set up axes
         self.ax.set_xlabel('Dose (Gy)', fontsize=12)
@@ -979,6 +1356,9 @@ class PIDEExplorerGUI:
     def plot_survival_data(self):
         """Plot survival curves for current experiments"""
         self.ax.clear()
+        self.plot_elements = {}
+        self.selected_exp_id = None
+        self.highlight_annotation = None
         
         experiments = self.current_experiments
         
@@ -1010,9 +1390,12 @@ class PIDEExplorerGUI:
             
             # Plot raw data points
             if show_raw and has_raw:
-                self.ax.scatter(raw_data['doses'], raw_data['sf'], 
-                               color=color, s=50, alpha=0.8, zorder=3,
-                               label=f'ExpID {exp_id} (LET={let:.1f})')
+                scatter_artist = self.ax.scatter(
+                    raw_data['doses'], raw_data['sf'],
+                    color=color, s=50, alpha=0.8, zorder=3,
+                    label=f'ExpID {exp_id} (LET={let:.1f})'
+                )
+                self.plot_elements.setdefault(exp_id, {})['scatter'] = scatter_artist
             
             # Plot LQ curve
             if show_lq and pd.notna(exp['ai_paper']):
@@ -1026,8 +1409,11 @@ class PIDEExplorerGUI:
                 linewidth = 1.5 if has_raw else 2
                 
                 label = f'LQ (α={alpha:.3f}, β={beta:.4f})' if not has_raw else None
-                self.ax.plot(doses, sf, color=color, linestyle=linestyle, 
-                            linewidth=linewidth, alpha=0.7, zorder=2, label=label)
+                line_artist, = self.ax.plot(
+                    doses, sf, color=color, linestyle=linestyle,
+                    linewidth=linewidth, alpha=0.7, zorder=2, label=label
+                )
+                self.plot_elements.setdefault(exp_id, {})['line'] = line_artist
         
         # Plot photon reference if requested
         if show_photon and not experiments.empty:
@@ -1118,11 +1504,19 @@ class PIDEExplorerGUI:
             else:
                 d10_str = 'N/A'
             
-            # Has raw data
-            has_raw = 'Yes' if self.data_manager.get_ion_raw_data(exp['ExpID']) is not None else 'No'
+            # Photon reference - shows which experiments share the same photon reference data
+            mode = self.selection_mode.get()
+            if mode == 'photon':
+                pub_id = exp['PublicationID']
+                photon_exp = int(exp['PhotonExpNum']) if pd.notna(exp['PhotonExpNum']) else 0
+                photon_ref = f"P{pub_id}-{photon_exp}"
+                has_raw = 'Yes' if self.data_manager.get_photon_raw_data(pub_id, photon_exp) is not None else 'No'
+            else:
+                photon_ref = '-'
+                has_raw = 'Yes' if self.data_manager.get_ion_raw_data(exp['ExpID']) is not None else 'No'
             
             self.tree.insert('', tk.END, values=(exp_id, cell, pub, let_str, energy_str, 
-                                                  alpha_str, beta_str, d10_str, has_raw))
+                                                  alpha_str, beta_str, d10_str, photon_ref, has_raw))
     
     def clear_plot(self):
         """Clear the plot"""
