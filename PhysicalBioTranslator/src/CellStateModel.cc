@@ -69,9 +69,14 @@ void CellStateModel::CellStateModelParameterSetup(Cell theCell)
 
 void CellStateModel::SetMisrepairRate(const std::string& cellType, double k_error)
 {
-    // Set the misrepair rate for a specific cell type
-    // This enables stochastic misrepair channel in S2->S3 transitions
     cellStateParaInfoMap[cellType].k_error = k_error;
+}
+
+void CellStateModel::SetMultiComponentParams(const std::string& cellType, double Nc, double omega_p, double lambda_p)
+{
+    cellStateParaInfoMap[cellType].Nc = Nc;
+    cellStateParaInfoMap[cellType].omega_p = omega_p;
+    cellStateParaInfoMap[cellType].lambda_p = lambda_p;
 }
 
 void CellStateModel::TissueGeometryInitialization(double xDim, double yDim, double zDim, double gridSize)
@@ -333,6 +338,8 @@ void CellStateModel::CellStateInitialization(int cellID,string cState)
     // If left uninitialized, st.E can become NaN/garbage and silently prevent transitions,
     // severely biasing survival (especially at 0 Gy and after division).
     cellState.E = 0.0;
+    cellState.Er = 0.0;
+    cellState.Ep = 0.0;
     if ((cState!="S1") && ( cState!="S2")&& (cState!="S3"))
     {
         cout<<cState<<endl;
@@ -363,6 +370,8 @@ void CellStateModel::CellStateInitialization(int cellID,string cState)
         double arrestedDuration = E20/sqrt(2*pi)/sigma*(f1/lambda1+f2/lambda2);
         cellState.duration = arrestedDuration;
         cellState.E = E20;
+        cellState.Er = E20;
+        cellState.Ep = 0.0;
     }
     if(cState=="S22")
     {
@@ -987,29 +996,26 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         if (phase.age <= phase.duration)
             return;
 
-        // ---- Priority 3: Mitotic Catastrophe Check ----
-        // Check residual damage before allowing division (only for S1/S2 cells)
+        // ---- Mitotic Catastrophe Check (uses E_eff = Er + omega_p * Ep) ----
         if (itSt != cellStateMap.end()) {
             const std::string& state = itSt->second.state;
-            if (state == "S1" || state == "S2") {  // Only check viable cells
-                double Ecur = itSt->second.E;
-                
-                // Use phase-specific E3 for mitotic threshold
+            if (state == "S1" || state == "S2") {
+                const double omega_p_mc = cellStateParaInfoMap.at(cellType).omega_p;
+                const double E_eff_mc = itSt->second.Er + omega_p_mc * itSt->second.Ep;
+
                 const double E3 = cellStateParaInfoMap.at(cellType).E3;
                 const double sigma = cellStateParaInfoMap.at(cellType).sigma;
-                double E3_mitotic = E3 * 0.7;  // Lower threshold for mitotic catastrophe
+                double E3_mitotic = E3 * 0.7;
                 
-                // Use soft saturation (consistent with Priority 1)
-                // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
                 double p_death = 0.0;
                 double mitotic_threshold = softSaturationEnabled ? 
                     (E3_mitotic + softSaturationMargin * sigma) : E3_mitotic;
-                if (Ecur >= mitotic_threshold) {
+                if (E_eff_mc >= mitotic_threshold) {
                     p_death = 1.0;
                 } else {
-                    double E_mitotic = -std::fabs(Ecur - E3_mitotic) / (2.0 * sigma);
+                    double E_mitotic = -std::fabs(E_eff_mc - E3_mitotic) / (2.0 * sigma);
                     p_death = 2.0 * GaussianCDF(E_mitotic, 0, 1);
-                    p_death = std::max(0.0, std::min(1.0, p_death));  // Clamp to [0,1]
+                    p_death = std::max(0.0, std::min(1.0, p_death));
                 }
                 
                 if (UniformRand() < p_death) {
@@ -1072,6 +1078,8 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellStateMap[id1].age = 0;
         cellStateMap[id1].duration = 1E+18;
         cellStateMap[id1].E = 0.0;
+        cellStateMap[id1].Er = 0.0;
+        cellStateMap[id1].Ep = 0.0;
 
         cellPositionMap[id1] = motherPos;
         cellHomeResidence[motherPos.i][motherPos.j][motherPos.k] = 1;
@@ -1093,6 +1101,8 @@ void CellStateModel::CellPhaseTransition(int cellID, double deltaT, int frequenc
         cellStateMap[id2].age = 0;
         cellStateMap[id2].duration = 1E+18;
         cellStateMap[id2].E = 0.0;
+        cellStateMap[id2].Er = 0.0;
+        cellStateMap[id2].Ep = 0.0;
 
         cellPositionMap[id2] = pick->second;
         cellHomeResidence[pick->second.i][pick->second.j][pick->second.k] = 1;
@@ -1159,13 +1169,24 @@ void CellStateModel::CellStateUpdate(int cellID,
     const double s = f1 + f2;
     if (s > 0.0) { f1 /= s; f2 /= s; } else { f1 = 1.0; f2 = 0.0; }
 
-    // combined decay factor over this step
+    // combined decay factor over this step (fast, for repairable component Er)
     const double decay =
         f1 * std::exp(-lambda1 * dt_h) +
         f2 * std::exp(-lambda2 * dt_h);
 
-    // update state energy
-    st.E = st.E * decay + dEinj;
+    // Multi-component energy update: split injection into Er (repairable) and Ep (persistent)
+    const double Nc = cellStateParaInfoMap.at(cellType).Nc;
+    const double lambda_p = cellStateParaInfoMap.at(cellType).lambda_p;
+    const double h_N = (DSBNum > 0 && Nc > 0.0)
+        ? (static_cast<double>(DSBNum) / (static_cast<double>(DSBNum) + Nc))
+        : 0.0;
+    const double dEp_inj = dEinj * h_N;
+    const double dEr_inj = dEinj - dEp_inj;
+    const double decay_p = std::exp(-lambda_p * dt_h);
+
+    st.Er = st.Er * decay   + dEr_inj;   // fast bi-exponential decay
+    st.Ep = st.Ep * decay_p + dEp_inj;   // slow mono-exponential decay
+    st.E  = st.Er + st.Ep;               // total energy (backward compat)
 
     // Store initial DSB count (legacy/diagnostic; misrepair now uses current E)
     if (DSBNum > 0) {
@@ -1431,26 +1452,26 @@ void CellStateModel::CellStateTransition(int cellID,
     }
 
     // =========================
-    // S2 transitions
+    // S2 transitions (uses E_eff = Er + omega_p * Ep for overlap calculations)
     // =========================
     if (st.state == "S2")
     {
-        const double Ecur = st.E;
+        const double omega_p = cellStateParaInfoMap.at(cellType).omega_p;
+        const double E_eff = st.Er + omega_p * st.Ep;
 
-        // S2 -> S1 (repair/recovery)
-        double ES2ToS1 = -std::fabs(Ecur - E1) / (2.0 * sigma);
+        // S2 -> S1 (repair/recovery) -- uses E_eff so persistent damage hinders recovery
+        double ES2ToS1 = -std::fabs(E_eff - E1) / (2.0 * sigma);
         double PS2ToS1 = 2.0 * GaussianCDF(ES2ToS1, 0, 1);
 
-        // S2 -> S3 (progression to lethal)
-        double ES2ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
+        // S2 -> S3 (progression to lethal) -- uses E_eff so persistent damage promotes death
+        double ES2ToS3 = -std::fabs(E_eff - E3) / (2.0 * sigma);
         double PS2ToS3 = 2.0 * GaussianCDF(ES2ToS3, 0, 1);
 
-        // Soft saturation: only trigger at extreme margin (Priority 1)
-        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
+        // Soft saturation
         if (softSaturationEnabled) {
-            if (Ecur >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
+            if (E_eff >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
         } else {
-            if (Ecur >= E3) PS2ToS3 = 1.0;  // Hard saturation
+            if (E_eff >= E3) PS2ToS3 = 1.0;
         }
 
         // Calculate baseline transition probabilities
@@ -1476,8 +1497,31 @@ void CellStateModel::CellStateTransition(int cellID,
                     const double t = itHoldAge->second;  // Current hold age
                     const double T_hold = itT_hold->second;  // Sampled hold duration
                     const double g = GatingFunction(t, T_hold, q_gate);
-                    // Apply gating to catastrophe probability
-                    p23_step = g * p23_0_step;
+                    
+                    if (checkpointMode == 0) {
+                        // Mode 0 (default): Gate only catastrophe probability
+                        // This is the original behavior: g(t) suppresses catastrophe early
+                        p23_step = g * p23_0_step;
+                    }
+                    else if (checkpointMode == 1) {
+                        // Mode 1 (attempt-based): Gate BOTH transitions (cell is frozen in arrest)
+                        p21_step = g * p21_step;
+                        p23_step = g * p23_0_step;
+                        
+                        if (lambda_commit > 0.0 && E_eff > 0.0) {
+                            const double dt_h = increaseTime / 3600.0;
+                            const double p_commit = 1.0 - std::exp(-lambda_commit * E_eff * dt_h);
+                            p23_step = p23_step + (1.0 - p23_step) * p_commit;
+                        }
+                    }
+                    else if (checkpointMode == 2) {
+                        // Mode 2 (gate recovery only): Biologically correct checkpoint.
+                        // Real G2/M checkpoint suppresses mitotic entry, not death.
+                        // Recovery (S2->S1) is gated: cell cannot re-enter cycle during arrest.
+                        // Catastrophe (S2->S3) is UNGATED: cell can still die from damage.
+                        p21_step = g * p21_step;
+                        // p23_step stays at p23_0_step (ungated)
+                    }
                 }
             }
         }
@@ -1689,23 +1733,22 @@ void CellStateModel::CellStateTransitionMisrepair(int cellID,
     }
 
     // =========================
-    // S2 transitions (with misrepair channel)
+    // S2 transitions (with misrepair channel, uses E_eff for overlaps)
     // =========================
     if (st.state == "S2")
     {
-        const double Ecur = st.E;
+        const double omega_p = par.omega_p;
+        const double E_eff = st.Er + omega_p * st.Ep;
 
-        double ES2ToS1 = -std::fabs(Ecur - E1) / (2.0 * sigma);
+        double ES2ToS1 = -std::fabs(E_eff - E1) / (2.0 * sigma);
         double PS2ToS1 = 2.0 * GaussianCDF(ES2ToS1, 0, 1);
 
-        double ES2ToS3 = -std::fabs(Ecur - E3) / (2.0 * sigma);
+        double ES2ToS3 = -std::fabs(E_eff - E3) / (2.0 * sigma);
         double PS2ToS3 = 2.0 * GaussianCDF(ES2ToS3, 0, 1);
-        // Soft saturation: only trigger at extreme margin (Priority 1)
-        // Hard saturation: Ecur >= E3, Soft saturation: Ecur >= E3 + margin*sigma
         if (softSaturationEnabled) {
-            if (Ecur >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
+            if (E_eff >= E3 + softSaturationMargin * sigma) PS2ToS3 = 1.0;
         } else {
-            if (Ecur >= E3) PS2ToS3 = 1.0;  // Hard saturation
+            if (E_eff >= E3) PS2ToS3 = 1.0;
         }
 
         double p21_step = 0.0;
@@ -1733,39 +1776,42 @@ void CellStateModel::CellStateTransitionMisrepair(int cellID,
                     const double t = itHoldAgeMis->second;  // Current hold age
                     const double T_hold = itT_holdMis->second;  // Sampled hold duration
                     const double g = GatingFunction(t, T_hold, q_gate);
-                    // Apply gating to catastrophe probability
-                    p23_cat_step = g * p23_energy_0_step;
+                    
+                    if (checkpointMode == 0) {
+                        // Mode 0 (default): Gate only catastrophe probability
+                        p23_cat_step = g * p23_energy_0_step;
+                    }
+                    else if (checkpointMode == 1) {
+                        // Mode 1 (attempt-based): Gate BOTH transitions
+                        // Recovery attempts suppressed -> also reduces misrepair deaths downstream
+                        p21_step = g * p21_step;
+                        // Catastrophe attempts also suppressed (cell frozen in arrest)
+                        p23_cat_step = g * p23_energy_0_step;
+                        
+                        // Background commitment hazard: severely damaged cells commit
+                        // to death during arrest even without attempting transitions
+                        if (lambda_commit > 0.0 && E_eff > 0.0) {
+                            const double dt_h = increaseTime / 3600.0;
+                            const double p_commit = 1.0 - std::exp(-lambda_commit * E_eff * dt_h);
+                            p23_cat_step = p23_cat_step + (1.0 - p23_cat_step) * p_commit;
+                        }
+                    }
                 }
             }
         }
 
         // =========================
         // MISREPAIR ON RECOVERY ATTEMPT (Version 2)
-        // 
-        // Radiobiological interpretation:
-        //   - Misrepair represents mitotic catastrophe: cells leave arrest,
-        //     try to divide with misrepaired damage, then fail.
-        //   - Misrepair death is triggered when cell ATTEMPTS recovery (S2→S1),
-        //     not as a constant background hazard.
-        //
-        // Logic:
-        //   p_mis = probability of lethal misrepair given a recovery attempt
-        //   p23_mis = p21 × p_mis      (death via failed recovery)
-        //   p21_eff = p21 × (1-p_mis)  (successful recovery)
-        //   p23 = p23_cat + p23_mis    (total death: catastrophe + misrepair)
-        //
-        // This produces LQ-like behavior:
-        //   - Misrepair on recovery → linear αD component (low dose)
-        //   - Catastrophe → quadratic βD² component (high dose)
+        // Uses Er (repairable) for misrepair hazard -- misrepair is about
+        // repairable damage being processed incorrectly during repair.
         // =========================
-        const double k_error_dsb = par.k_error; // per (DSB*hour)
-        const double alpha_dsb   = par.alpha;   // energy per DSB
+        const double k_error_dsb = par.k_error;
+        const double alpha_dsb   = par.alpha;
 
         const double k_error_energy =
-            (alpha_dsb > 0.0) ? (std::max(0.0, k_error_dsb) / alpha_dsb) : 0.0; // 1/(energy*hour)
+            (alpha_dsb > 0.0) ? (std::max(0.0, k_error_dsb) / alpha_dsb) : 0.0;
 
-        // Misrepair probability (conditional on recovery attempt)
-        const double lambda_mis = k_error_energy * std::max(0.0, Ecur); // 1/h
+        const double lambda_mis = k_error_energy * std::max(0.0, st.Er); // uses Er, not total E
         double p_mis = 1.0 - std::exp(-lambda_mis * std::max(0.0, increaseTime));
         p_mis = clamp01(p_mis);
 
@@ -1972,6 +2018,26 @@ void CellStateModel::SetSoftSaturationEnabled(bool enabled)
 bool CellStateModel::IsSoftSaturationEnabled() const
 {
     return softSaturationEnabled;
+}
+
+void CellStateModel::SetCheckpointMode(int mode)
+{
+    checkpointMode = mode;
+}
+
+int CellStateModel::GetCheckpointMode() const
+{
+    return checkpointMode;
+}
+
+void CellStateModel::SetCommitmentHazardRate(double lambda)
+{
+    lambda_commit = lambda;
+}
+
+double CellStateModel::GetCommitmentHazardRate() const
+{
+    return lambda_commit;
 }
 
 map< int, int > CellStateModel::GetCellAncestryID()

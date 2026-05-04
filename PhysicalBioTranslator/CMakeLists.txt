@@ -116,6 +116,91 @@ if(BUILD_PBT_TEST)
             ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
         
         message(STATUS "Calibration validation test configured")
+        
+        # Test 8: PIDE Multi-Cell Validation test
+        add_executable(test_pide_multi_cell_validation 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_pide_multi_cell_validation.cc)
+        
+        target_link_libraries(test_pide_multi_cell_validation 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_pide_multi_cell_validation PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "PIDE multi-cell validation test configured")
+        
+        # Test 9: Time Window Sensitivity test
+        add_executable(test_time_window_sensitivity 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_time_window_sensitivity.cc)
+        
+        target_link_libraries(test_time_window_sensitivity 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_time_window_sensitivity PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "Time window sensitivity test configured")
+        
+        # Test 10: Simulation-Based Calibration
+        add_executable(test_simulation_calibration 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_simulation_calibration.cc)
+        
+        target_link_libraries(test_simulation_calibration 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_simulation_calibration PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "Simulation-based calibration test configured")
+        
+        # Test 11: Multi-Component Energy Model Validation
+        add_executable(test_multicomponent_validation 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_multicomponent_validation.cc)
+        
+        target_link_libraries(test_multicomponent_validation 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_multicomponent_validation PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "Multi-component energy model validation test configured")
+        
+        # Test 12: Multi-Component Joint Calibration (replaces grid scan)
+        add_executable(test_multicomponent_calibration 
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_multicomponent_calibration.cc)
+        
+        target_link_libraries(test_multicomponent_calibration 
+            PhysicalBioTranslator 
+            CellMaker
+            CellStateModelCalibration
+            OpenMP::OpenMP_CXX)
+        
+        target_include_directories(test_multicomponent_calibration PRIVATE
+            ${PBT_INCLUDE_DIR}
+            ${CMAKE_SOURCE_DIR}/CellMaker/include
+            ${CMAKE_SOURCE_DIR}/CellStateModelCalibration/include)
+        
+        message(STATUS "Multi-component joint calibration test configured")
     else()
         message(STATUS "OpenMP not found - skipping parallel version")
     endif()

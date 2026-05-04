@@ -233,6 +233,20 @@ struct FitConfigS2 {
     bool fix_T21;        ///< If true, T21 is fixed at T21_fixed; if false, T21 is optimized
     bool fix_T23;        ///< If true, T23 is fixed at T23_fixed; if false, T23 is optimized
 
+    // Bi-exponential repair kinetics (fixed from experiment, not fitted)
+    double f1;           ///< Fast repair fraction
+    double f2;           ///< Slow repair fraction
+    double lambda1_rep;  ///< Fast repair rate (1/hr, after any scaling)
+    double lambda2_rep;  ///< Slow repair rate (1/hr, after any scaling)
+
+    // Multi-component energy model flags
+    bool fix_Nc;         ///< If true, Nc is fixed at Nc_fixed
+    double Nc_fixed;     ///< User-defined Nc value when fixed
+
+    // S1 observation timescales (not fitted, fixed to cell cycle time)
+    double To12;         ///< Observation window for S1->S2 transition (hours)
+    double To13;         ///< Observation window for S1->S3 transition (hours)
+
     FitConfigS2()
         : kappa(40.0)
         , eps_sf(1e-12)
@@ -242,6 +256,14 @@ struct FitConfigS2 {
         , T23_fixed(24.0)         // Default: 24 hours
         , fix_T21(false)          // Default: optimize T21
         , fix_T23(false)          // Default: optimize T23
+        , f1(0.62)
+        , f2(0.38)
+        , lambda1_rep(0.331)      // Default: 3.31 * 0.1 (scaled)
+        , lambda2_rep(0.014)      // Default: 0.14 * 0.1 (scaled)
+        , fix_Nc(false)
+        , Nc_fixed(30.0)
+        , To12(10.0)             // Default: cell cycle time
+        , To13(10.0)             // Default: cell cycle time
     {}
 
     /**
@@ -311,16 +333,25 @@ struct ParamsS2 {
     double T23;     ///< Death timescale in hours (>0) - OPTIMIZED
     double k_error; ///< Misrepair rate per (DSB*hour) - stochastic misrepair channel
 
-    ParamsS2() : e2(10.0), e3(25.0), a(1.0), T21(12.0), T23(48.0), k_error(0.0) {}
+    // Multi-component energy parameters (Er/Ep split)
+    double Nc;        ///< Half-saturation DSB count for persistent fraction h(N) = N/(N+Nc)
+    double omega_p;   ///< Persistent energy weight in S2: E_eff = Er + omega_p * Ep
+    double lambda_p;  ///< Slow decay rate for persistent energy Ep (1/hour)
+
+    ParamsS2() : e2(10.0), e3(25.0), a(1.0), T21(12.0), T23(48.0), k_error(0.0),
+                 Nc(1e9), omega_p(1.0), lambda_p(0.0) {}
     ParamsS2(double e2_val, double e3_val, double a_val,
-             double T21_val = 12.0, double T23_val = 48.0, double k_error_val = 0.0)
-        : e2(e2_val), e3(e3_val), a(a_val), T21(T21_val), T23(T23_val), k_error(k_error_val) {}
+             double T21_val = 12.0, double T23_val = 48.0, double k_error_val = 0.0,
+             double Nc_val = 1e9, double omega_p_val = 1.0, double lambda_p_val = 0.0)
+        : e2(e2_val), e3(e3_val), a(a_val), T21(T21_val), T23(T23_val), k_error(k_error_val),
+          Nc(Nc_val), omega_p(omega_p_val), lambda_p(lambda_p_val) {}
 
     /**
      * @brief Check if parameters satisfy physical constraints
      */
     bool isValid() const {
-        return (e2 > 0.0) && (e3 > e2) && (a > 0.0) && (T21 > 0.0) && (T23 > 0.0) && (k_error >= 0.0);
+        return (e2 > 0.0) && (e3 > e2) && (a > 0.0) && (T21 > 0.0) && (T23 > 0.0)
+               && (k_error >= 0.0) && (Nc > 0.0) && (omega_p > 0.0) && (lambda_p >= 0.0);
     }
 
     /**
@@ -335,6 +366,9 @@ struct ParamsS2 {
         std::cout << "  T21     = " << T21 << " hours (repair timescale) - OPTIMIZED\n";
         std::cout << "  T23     = " << T23 << " hours (death timescale) - OPTIMIZED\n";
         std::cout << "  k_error = " << k_error << " per (DSB*hour) (misrepair rate)\n";
+        std::cout << "  Nc      = " << Nc << " (half-saturation DSB count)\n";
+        std::cout << "  omega_p = " << omega_p << " (persistent energy weight)\n";
+        std::cout << "  lambda_p= " << lambda_p << " 1/hr (persistent decay rate)\n";
         std::cout << "===============================================\n";
     }
 };
@@ -362,13 +396,19 @@ struct CellStateModelParamsS2 {
     double T23;     ///< Death timescale (hours) - from optimization
     double k_error; ///< Misrepair rate per (DSB*hour) - stochastic misrepair channel
 
+    // Multi-component energy parameters
+    double Nc;        ///< Half-saturation DSB count for persistent fraction
+    double omega_p;   ///< Persistent energy weight for S2 transitions
+    double lambda_p;  ///< Slow decay rate for persistent energy (1/hour)
+
     CellStateModelParamsS2()
         : E1(0.0), E2(0.0), E3(0.0), sigma(1.0), alpha(0.0)
-        , kappa(40.0), T21(12.0), T23(48.0), k_error(0.0) {}
+        , kappa(40.0), T21(12.0), T23(48.0), k_error(0.0)
+        , Nc(1e9), omega_p(1.0), lambda_p(0.0) {}
 
     /**
      * @brief Create from reduced parameters by specifying sigma
-     * @param reduced Fitted parameters (e2, e3, a, T21, T23, k_error) - all from optimization
+     * @param reduced Fitted parameters - all from optimization
      * @param sigma_value Chosen sigma value
      * @param kappa_value DSB per Gy
      * @return Full physical parameters
@@ -383,9 +423,12 @@ struct CellStateModelParamsS2 {
         params.sigma = sigma_value;
         params.alpha = reduced.a * sigma_value;
         params.kappa = kappa_value;
-        params.T21 = reduced.T21;      // From optimization result
-        params.T23 = reduced.T23;      // From optimization result
-        params.k_error = reduced.k_error;  // From optimization result (dimension-independent)
+        params.T21 = reduced.T21;
+        params.T23 = reduced.T23;
+        params.k_error = reduced.k_error;
+        params.Nc = reduced.Nc;
+        params.omega_p = reduced.omega_p;
+        params.lambda_p = reduced.lambda_p;
         return params;
     }
 
@@ -418,6 +461,9 @@ struct CellStateModelParamsS2 {
         std::cout << "  T21 (repair time):      " << T21 << " hours\n";
         std::cout << "  T23 (death time):       " << T23 << " hours\n";
         std::cout << "  k_error (misrepair):    " << k_error << " per (DSB*hour)\n";
+        std::cout << "  Nc (half-sat DSB):      " << Nc << "\n";
+        std::cout << "  omega_p (persist wt):   " << omega_p << "\n";
+        std::cout << "  lambda_p (persist rate): " << lambda_p << " 1/hr\n";
         std::cout << "\nDerived quantities:\n";
         if (alpha > 1e-9) {
             double repair_dsb = E2 / alpha;
@@ -428,6 +474,9 @@ struct CellStateModelParamsS2 {
                 std::cout << "  Repair dose (E2/alpha/kappa):    " << std::setprecision(3) << repair_dsb / kappa << " Gy\n";
                 std::cout << "  Death dose (E3/alpha/kappa):     " << death_dsb / kappa << " Gy\n";
             }
+        }
+        if (lambda_p > 1e-9) {
+            std::cout << "  Persistent half-life:   " << std::setprecision(1) << (0.693 / lambda_p) << " hours\n";
         }
         std::cout << "================================================\n";
     }

@@ -101,6 +101,24 @@ if(BUILD_CALIBRATION_TESTS)
     )
 
     message(STATUS "Misrepair Calibration test configured")
+
+    # Backward Compatibility Test (old vs new multi-component model)
+    add_executable(test_backward_compat
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_backward_compat.cc
+    )
+
+    target_link_libraries(test_backward_compat CellStateModelCalibration)
+
+    target_include_directories(test_backward_compat PRIVATE
+        ${CALIBRATION_INCLUDE_DIR}
+    )
+
+    set_target_properties(test_backward_compat PROPERTIES
+        CXX_STANDARD 11
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    message(STATUS "Backward compatibility test configured")
 endif()
 
 #----------------------------------------------------------------------------

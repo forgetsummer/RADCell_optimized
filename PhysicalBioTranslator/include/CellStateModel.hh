@@ -25,6 +25,7 @@ public:
 
     void CellStateModelParameterSetup(Cell theCell);// function for setting up the simulation parameters for cell state model
     void SetMisrepairRate(const std::string& cellType, double k_error); // Set misrepair rate for a cell type
+    void SetMultiComponentParams(const std::string& cellType, double Nc, double omega_p, double lambda_p);
     void TissueGeometryInitialization(double xDim, double yDim, double zDim,double gridSize);
     void CellTypeInitialiation(int cellId, Cell theCell);
     void CellPositionInitialization(int cellID, double cx, double cy, double cz);
@@ -53,6 +54,15 @@ public:
     // Checkpoint enable/disable (Probabilistic Checkpoint Design only)
     void SetCheckpointEnabled(bool enabled); // Enable or disable checkpoint mechanism
     bool IsCheckpointEnabled() const; // Check if checkpoint is enabled
+    
+    // Checkpoint mode: 0 = gating-catastrophe (default), 1 = attempt-based gating
+    void SetCheckpointMode(int mode);
+    int GetCheckpointMode() const;
+    
+    // Background commitment hazard rate for attempt-based checkpoint (mode 1)
+    // Units: per (energy * hour). Only active when checkpointMode == 1.
+    void SetCommitmentHazardRate(double lambda);
+    double GetCommitmentHazardRate() const;
     
     // Priority 1: Soft saturation enable/disable
     void SetSoftSaturationEnabled(bool enabled); // Enable or disable soft saturation (E3 + 3.0*sigma vs E3)
@@ -94,7 +104,9 @@ private:
         std::string state;// state , {S1,S2,S3}
         double age;
         double duration;
-        double E;// cell state energy
+        double E;// cell state energy (total = Er + Ep)
+        double Er = 0.0;  // repairable energy component (fast bi-exponential decay)
+        double Ep = 0.0;  // persistent energy component (slow mono-exponential decay)
     };
 
     struct CycleInfo
@@ -130,6 +142,9 @@ private:
         double To21;
         double To23;
         double k_error;  // misrepair error rate constant for stochastic misrepair channel
+        double Nc = 30.0;        // half-saturation DSB count for persistent fraction h(N) = N/(N+Nc)
+        double omega_p = 1.5;    // persistent energy weight for S2 transitions: E_eff = Er + omega_p*Ep
+        double lambda_p = 0.03;  // slow decay rate for persistent energy Ep (1/hour)
     };
 
     struct PositionInfo
@@ -159,6 +174,8 @@ private:
 
     // Checkpoint parameters (Probabilistic Checkpoint Design)
     bool checkpointEnabled = true;  // Enable/disable checkpoint mechanism
+    int checkpointMode = 0;         // 0 = gating-catastrophe (default), 1 = attempt-based gating
+    double lambda_commit = 0.0;     // Background commitment hazard rate per (energy*hour), mode 1 only
     
     // Probabilistic checkpoint parameters
     double k_hold = 1.5;        // Threshold parameter: E_hold = E3 - k_hold*sigma (default: 1.5)

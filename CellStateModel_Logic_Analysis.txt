@@ -1,0 +1,689 @@
+================================================================================
+            CELL STATE TRANSITION MODEL  –  COMPLETE LOGIC ANALYSIS
+            Source: CellStateModel.cc + CellStateModel.hh
+            (Multi-Component Energy Er/Ep Implementation)
+            Date: 2026-04-24
+================================================================================
+
+OVERVIEW
+========
+The Cell State Model simulates the fate of irradiated cells through two
+coupled subsystems that evolve in discrete time steps (typically 60 seconds):
+
+  1. CELL CYCLE PHASE system:  G0 → G1 → S → G2 → M → Division
+     Controls proliferation, contact inhibition, and mitotic catastrophe.
+
+  2. CELL STATE system:        S1 (Healthy) / S2 (Arrested) / S3 (Dead)
+     Controls damage response, repair, and cell killing.
+
+Each cell has both a phase (G0/G1/S/G2/M) and a state (S1/S2/S3).
+Only S1 cells can progress through the cell cycle; S2 and S3 cells are
+frozen in their current phase.
+
+The model uses a MULTI-COMPONENT ENERGY representation:
+  - Er: Repairable energy (fast bi-exponential decay, ~minutes to hours)
+  - Ep: Persistent energy (slow mono-exponential decay, ~hours to days)
+  - E  = Er + Ep      (total energy, used for S1 transitions)
+  - E_eff = Er + ωp·Ep (effective energy, used for S2 transitions
+                         and mitotic catastrophe)
+
+The energy is an abstract quantity that maps DNA double-strand break (DSB)
+counts to a dimensionless "state energy" via: dE = α × DSB_count.
+
+
+================================================================================
+PART 1:  CELL CYCLE PHASE TRANSITIONS
+        (CellPhaseUpdate → CellPhaseTransition)
+        Source: CellStateModel.cc, lines 828–1129
+================================================================================
+
+PROLIFERATION GATE (CellPhaseUpdate, line 857):
+  proliferativeFromCellState = (state == "S1")
+  cellProliferativeMap[cellID] = proliferationState AND proliferativeFromCellState
+
+  → ONLY S1 cells are allowed to cycle.
+  → S2 cells: cycle FROZEN (repair arrest)
+  → S3 cells: cycle FROZEN (dead)
+  → This is the fundamental coupling between the state and phase systems.
+
+TELOMERE CHECK (line 890):
+  If telomereFraction <= 8.88E-16 → force G0 (permanent quiescence)
+  Daughters inherit 0.5 × mother's telomere at division.
+
+CONTACT INHIBITION HELPER (line 902):
+  hasSpaceForDivision() checks the 3D grid for an empty neighbor cell.
+  Used at G1→S and G2→M transitions (two checkpoints for space).
+
+PHASE TRANSITIONS:
+
+  [G0] → [G1] (line 912)
+    Condition: Cell is proliferative (S1 + external nutrient signal)
+    Duration of G1: Gaussian(μ_G1, σ_G1)  [default: μ=1.5h, σ=0.25h]
+    G0 duration: effectively infinite (1E+18 hours)
+
+  [G1] → [S] or [G0] (line 923)
+    Condition: age > duration
+    IF space available (contact inhibition check):
+      → S phase, duration = Gaussian(μ_S, σ_S)  [default: μ=6.0h, σ=0.25h]
+    ELSE:
+      → G0 (quiescence, wait for space)
+
+  [S] → [G2] (line 950)
+    Condition: age > duration
+    No contact inhibition check (cell already committed to replication)
+    Duration of G2: Gaussian(μ_G2, σ_G2)  [default: μ=1.5h, σ=0.25h]
+
+  [G2] → [M] or [G0] (line 965)
+    Condition: age > duration
+    IF space available (contact inhibition check):
+      → M phase, duration = Gaussian(μ_M, σ_M)  [default: μ=1.0h, σ=0.25h]
+    ELSE:
+      → G0 (quiescence)
+
+  [M] → DIVISION or MITOTIC CATASTROPHE (line 992)
+    Condition: age > duration
+    See PART 6 for mitotic catastrophe details.
+    See PART 7 for cell division details.
+
+  Total cell cycle time: T_cycle = 1.5 + 6.0 + 1.5 + 1.0 = 10.0 hours
+
+
+================================================================================
+PART 2:  MULTI-COMPONENT ENERGY UPDATE
+        (CellStateUpdate, lines 1131–1293)
+================================================================================
+
+Called once per cell per time step. Converts DSB counts into energy,
+updates Er and Ep, then dispatches to state transition logic.
+
+STEP 1: TIME CONVERSION (line 1149)
+  dt_h = deltaT × frequency / 3600     [seconds → hours]
+  Typical: deltaT=60s, frequency=1 → dt_h = 1/60 hour
+
+STEP 2: ENERGY INJECTION (lines 1154–1160)
+  dE_inj = α × DSB_new + β × integral_concentration
+  DSB_new > 0 only on the FIRST time step after irradiation.
+  In current test setups: β=0, so dE_inj = α × DSB_new.
+
+STEP 3: PERSISTENT FRACTION SPLIT (lines 1177–1184)
+  h(N) = N / (N + Nc)       if DSB_new > 0 and Nc > 0
+       = 0                   otherwise
+
+  dEp_inj = dE_inj × h(N)       [persistent component]
+  dEr_inj = dE_inj × (1 - h(N)) [repairable component]
+
+  Physics of h(N):
+    At low DSB (N << Nc):  h ≈ N/Nc ≈ 0  → almost all energy is repairable
+    At N = Nc:             h = 0.5        → half goes to each pool
+    At high DSB (N >> Nc): h → 1          → most energy is persistent
+
+  Nc controls the "complexity threshold": how many DSBs before a
+  significant fraction becomes hard-to-repair (clustered/complex damage).
+
+STEP 4: ENERGY DECAY (lines 1162–1189)
+
+  REPAIRABLE (Er) — Bi-exponential decay:
+    decay_r = f1 × exp(−λ1 × dt_h) + f2 × exp(−λ2 × dt_h)
+    Er(t+dt) = Er(t) × decay_r + dEr_inj
+
+    Current parameters (with 0.1× repair rate scaling):
+      f1 = 0.62,  λ1 = 0.331/h  (τ1 = 3.02h)
+      f2 = 0.38,  λ2 = 0.014/h  (τ2 = 71.4h)
+    These represent the well-established biphasic DSB repair kinetics:
+      Fast component (~62%): NHEJ pathway, t½ ≈ 2.1h (scaled)
+      Slow component (~38%): HR pathway,   t½ ≈ 50h (scaled)
+
+  PERSISTENT (Ep) — Mono-exponential decay:
+    decay_p = exp(−λp × dt_h)
+    Ep(t+dt) = Ep(t) × decay_p + dEp_inj
+
+    λp is the slow repair rate for complex/clustered damage.
+    Biologically motivated range: λp = 0.05–0.17/h (t½ = 4–14h)
+
+  TOTAL ENERGY:
+    E = Er + Ep      (used for S1 state transitions)
+
+  EFFECTIVE ENERGY:
+    E_eff = Er + ωp × Ep    (used for S2 transitions, mitotic catastrophe)
+    ωp weights how much persistent damage contributes to cell fate.
+    ωp > 1 means persistent damage is more lethal per unit than repairable.
+    Biologically motivated range: ωp = 1.0–2.5
+
+STEP 5: TRANSITION TYPE (line 1201)
+  IF DSB_new > 0:  transitionType = INSTANTANEOUS
+    → Overlap probability p_sp used directly (full probability in one step)
+  ELSE:            transitionType = DELAYED
+    → p_step = 1 − (1 − p_sp)^(dt_h / To)
+    → Scales cumulative probability by time step fraction
+
+STEP 6: PHASE-DEPENDENT THRESHOLD ADJUSTMENT (lines 1229–1287)
+  Each cell cycle phase modifies the state energy thresholds E2, E3
+  to represent phase-specific radiosensitivity:
+
+  Phase   E1        E2                                   E3
+  ─────   ──        ──                                   ──
+  G1      E1        E2                                   E3  (baseline)
+  S       0         E3_S − √((E3−E2)² − 8σ²·ln(fS))    √(E3² − 8σ²·ln(fS))
+  G2      0         Similar with fG2                     Similar with fG2
+  M       0         Similar with fM                      Similar with fM
+  G0      0         E2                                   E3
+
+  Default phase factors: fG1=1.0, fS=0.816, fG2=1.015, fM=1.015
+  fS < 1: S-phase cells are MORE sensitive (lower thresholds)
+  fG2,fM > 1: G2/M cells are slightly LESS sensitive
+
+STEP 7: DISPATCH TO STATE TRANSITION (line 1214)
+  IF k_error > 1e-10:
+    → CellStateTransitionMisrepair()  (includes misrepair channel)
+  ELSE:
+    → CellStateTransition()           (standard, no misrepair)
+
+STEP 8: CHECKPOINT HOLD AGE INCREMENT (lines 1216–1226)
+  IF cell is in S2 AND checkpointEnabled AND has holdAge entry:
+    holdAge += dt_h
+
+
+================================================================================
+PART 3:  S1 (HEALTHY) STATE TRANSITIONS
+        (CellStateTransitionMisrepair, lines 1611–1733)
+================================================================================
+
+S1 is the healthy/clonogenic state. A cell in S1 with elevated energy
+can transition to S2 (damage arrest) or S3 (death).
+
+STEP 1: OVERLAP PROBABILITIES (lines 1613–1620)
+  Uses TOTAL energy E = Er + Ep (NOT E_eff):
+
+    PS1→S2 = 2 × Φ(−|E − E2| / (2σ))    [arrest probability]
+    PS1→S3 = 2 × Φ(−|E − E3| / (2σ))    [death probability]
+
+  where Φ is the standard normal CDF.
+
+  These are Gaussian overlap integrals: the probability that a cell
+  at energy E "overlaps" with the energy distribution centered at E2
+  (arrest attractor) or E3 (death attractor).
+
+  KEY: These are recomputed EVERY TIME STEP as E decays.
+    → As damage repairs: PS1→S2 decreases, PS1→S3 decreases.
+    → At E=0 (no damage): both → ~0 (cell stays healthy).
+    → At E=E2: PS1→S2 is maximized.
+    → At E≥E3: PS1→S3 → 1 (saturation).
+
+STEP 2: SOFT SATURATION (lines 1624–1628)
+  IF softSaturationEnabled AND E ≥ E3 + margin×σ:
+    PS1→S3 = 1.0  (guaranteed death)
+  Current setting: margin = 0.0 → hard saturation at E3.
+
+STEP 3: PER-STEP PROBABILITY (lines 1631–1642)
+  INSTANTANEOUS (DSB_new > 0):
+    p12_step = PS1→S2     [full probability applied once]
+    p13_step = PS1→S3
+
+  DELAYED (no new DSBs):
+    p12_step = 1 − (1 − PS1→S2)^(dt_h / To12)     To12 = 10h
+    p13_step = 1 − (1 − PS1→S3)^(dt_h / To13)     To13 = 10h
+
+  The delayed formula models the observation window: over T_obs hours,
+  the cell has this cumulative probability of transitioning. The per-step
+  probability scales down proportionally.
+
+STEP 4: CHECKPOINT DIVERSION (lines 1645–1663)
+  IF checkpointEnabled:
+    E_hold = E3 − k_hold × σ = E3 − 1.5σ    [checkpoint threshold]
+    π(E) = 1 / (1 + exp(−(E − E_hold) / w_hold))   [logistic engagement]
+
+    Modified probabilities (η = 1.0):
+      p13' = (1 − η × π(E)) × p13     [reduced direct death]
+      p12' = p12 + η × π(E) × p13      [death diverted to arrest]
+
+  Effect: At high damage near E3, the checkpoint intercepts cells
+  destined for death and diverts them into the repair (S2) pathway.
+    At E = E_hold: ~50% of would-be deaths become S2 arrests.
+    At E >> E_hold: nearly all deaths become S2 arrests.
+    At E << E_hold: checkpoint has no effect.
+
+STEP 5: NORMALIZE AND DRAW (lines 1667–1731)
+  Ensure p12 + p13 ≤ 1 (rescale if exceeded).
+
+  Draw u ~ Uniform(0,1):
+    u < p13           → S3 (DEATH, immediate)
+    u < p13 + p12     → S2 (ARREST)
+      Checkpoint engagement (second draw):
+        u_ckpt < π(E)  → Checkpoint ENGAGED:
+          Sample T_hold ~ LogNormal(μ_E, σ_T_hold)
+            Median scales with T_cycle: 0.4–1.0 × T_cycle
+            Clamped to [0.1×T_cycle, 1.5×T_cycle]
+          Initialize holdAge = 0
+        u_ckpt ≥ π(E)  → S2 without checkpoint
+    else               → Stay S1 (no transition)
+
+
+================================================================================
+PART 4:  S2 (ARRESTED/REPAIR) STATE TRANSITIONS
+        (CellStateTransitionMisrepair, lines 1738–1858)
+================================================================================
+
+S2 is the damage/arrest state. A cell in S2 can recover to S1 or die
+to S3 via two distinct pathways: catastrophe and misrepair.
+
+CRITICAL DIFFERENCE FROM S1:
+  S2 uses EFFECTIVE ENERGY E_eff = Er + ωp × Ep (NOT total E).
+  This means persistent damage (Ep) is weighted by ωp in S2 fate
+  decisions, making it harder to recover when ωp > 1.
+
+STEP 1: OVERLAP PROBABILITIES (lines 1740–1752)
+  E_eff = Er + ωp × Ep
+
+  PS2→S1 = 2 × Φ(−|E_eff − E1| / (2σ))     [recovery probability]
+  PS2→S3 = 2 × Φ(−|E_eff − E3| / (2σ))     [catastrophe probability]
+
+  Since E1 = 0 (healthy energy):
+    PS2→S1 = 2 × Φ(−E_eff / (2σ))
+    → Increases as E_eff → 0 (damage repaired)
+    → Decreases as E_eff increases (more damage)
+
+  Saturation: If E_eff ≥ E3 → PS2→S3 = 1.0
+
+STEP 2: PER-STEP PROBABILITY (lines 1754–1765)
+  p21_step = per-step recovery (using To21)
+  p23_energy_step = per-step catastrophe (using To23)
+
+  To21 and To23 are the S2 observation timescales.
+  When using fitted timescales: To21 = To23 = 10h (matched to calibration)
+  When using effective repair time: To21 = To23 ≈ 29h
+
+STEP 3: CHECKPOINT GATING (lines 1767–1801)
+  IF cell has checkpoint engaged AND holdAge < T_hold:
+
+    g(t) = (holdAge / T_hold)^q_gate    [q_gate = 1.5]
+
+    When holdAge = 0:      g = 0    (catastrophe fully suppressed)
+    When holdAge = T_hold:  g = 1    (catastrophe fully released)
+    At 50% of T_hold:      g = 0.35  (65% suppression)
+
+    Mode 0 (default):
+      p23_cat = g × p23_energy    [only catastrophe is gated]
+      p21 unchanged               [recovery attempts continue normally]
+
+    Mode 1 (attempt-based):
+      p21 = g × p21               [recovery also suppressed]
+      p23_cat = g × p23_energy    [catastrophe suppressed]
+      Optional: commitment hazard if λ_commit > 0 and E_eff > 0:
+        p_commit = 1 − exp(−λ_commit × E_eff × dt_h)
+        p23_cat += (1 − p23_cat) × p_commit
+
+STEP 4: MISREPAIR CHANNEL (lines 1803–1827)
+  This is the key misrepair mechanism, tied to recovery ATTEMPTS:
+
+    k_error_energy = k_error / α     [convert DSB-rate to energy-rate]
+    λ_mis = k_error_energy × Er      [hazard proportional to REPAIRABLE energy]
+    p_mis = 1 − exp(−λ_mis × dt_h)   [misrepair probability this step]
+
+  Misrepair death:     p23_mis = p21_step × p_mis
+  Successful recovery: p21_eff = p21_step × (1 − p_mis)
+
+  KEY POINTS:
+    - Misrepair ONLY fires when cell ATTEMPTS recovery (S2→S1).
+    - It does NOT fire as a background hazard while cell sits in S2.
+    - Uses Er (repairable energy), NOT total E or E_eff.
+    - Rationale: misrepair is about the repair machinery processing
+      damage incorrectly; only repairable damage can be misrepaired.
+    - As Er decays: λ_mis decreases → misrepair probability drops.
+
+STEP 5: TOTAL DEATH PROBABILITY (lines 1822–1834)
+  p23_total = p23_cat + p23_mis      [catastrophe + misrepair]
+  p21_final = p21_eff                 [successful recovery only]
+
+  These represent two INDEPENDENT pathways to death:
+    PATH A: Catastrophe — energy-based, overlap with E3 using E_eff
+    PATH B: Misrepair — conditional on recovery attempt, proportional to Er
+
+  Normalize if p23 + p21 > 1 (safety clamp).
+
+STEP 6: DRAW (lines 1836–1857)
+  Draw u ~ Uniform(0,1):
+    u < p23_total          → S3 (DEATH: catastrophe or misrepair)
+    u < p23_total + p21    → S1 (SUCCESSFUL RECOVERY)
+    else                   → Stay S2, age += dt_h
+
+  On any S2 exit (to S1 or S3):
+    Clean up: erase holdAge, T_hold, checkpointEngaged entries.
+
+
+================================================================================
+PART 5:  S3 (DEAD) — ABSORBING STATE
+        (Line 1864–1867)
+================================================================================
+
+  age += dt_h    [no transitions out, cell is permanently dead]
+
+  S3 cells:
+    - Cannot proliferate (cycle frozen)
+    - Cannot recover
+    - Remain in the simulation for bookkeeping
+    - Are counted as dead in the colony assay
+
+
+================================================================================
+PART 6:  MITOTIC CATASTROPHE
+        (CellPhaseTransition, lines 999–1031)
+================================================================================
+
+Triggered when an S1 or S2 cell completes M phase (age > duration).
+Uses E_eff (NOT total E), with a REDUCED death threshold.
+
+  E_eff_mc = Er + ωp × Ep                    [effective energy]
+  E3_mitotic = 0.7 × E3                      [70% of normal threshold]
+  threshold = E3_mitotic + margin × σ         [with soft saturation]
+
+  IF E_eff_mc ≥ threshold:
+    p_death = 1.0                             [certain death]
+  ELSE:
+    p_death = 2 × Φ(−|E_eff_mc − E3_mitotic| / (2σ))
+
+  Draw: u < p_death → S3 (dead, no division, return immediately)
+
+  Rationale: Cells entering mitosis with unresolved damage face
+  additional lethality because chromosome segregation amplifies
+  damage (missegregation, anaphase bridges, micronuclei).
+  The 0.7× threshold makes mitosis ~30% more stringent than
+  the normal death check.
+
+
+================================================================================
+PART 7:  CELL DIVISION
+        (CellPhaseTransition, lines 1034–1129)
+================================================================================
+
+Triggered after surviving the mitotic catastrophe check.
+
+  1. SPACE CHECK:
+     IF no space available (contact inhibition) → G0 (wait)
+
+  2. DIVISION:
+     Mother cell is ERASED from all maps.
+     Two daughter cells are created:
+
+     Daughter 1: position = mother's position
+       phase = G0, state = S1
+       E = 0.0, Er = 0.0, Ep = 0.0    [clean, no damage!]
+       telomere = 0.5 × mother's telomere
+       ancestryID = mother's ancestryID
+
+     Daughter 2: position = random available neighbor
+       phase = G0, state = S1
+       E = 0.0, Er = 0.0, Ep = 0.0    [clean, no damage!]
+       telomere = 0.5 × mother's telomere
+       ancestryID = mother's ancestryID
+
+  KEY IMPLICATIONS:
+    - Daughters start with ZERO energy → will stay in S1 permanently
+      (unless re-irradiated)
+    - Both daughters inherit the SAME ancestry ID → they count toward
+      the same colony in the colony formation assay
+    - Any cell reaching division creates "immortal" progeny (E=0)
+    - This is the mechanism by which colonies grow: one S1 cell that
+      survives damage, reaches mitosis, and divides, creates 2 clean
+      S1 daughters that can each divide again
+
+
+================================================================================
+PART 8:  COLONY FORMATION ASSAY (Survival Counting)
+        (Test code, not in CellStateModel itself)
+================================================================================
+
+At the end of the simulation (t = T_assay, typically 27.8 hours):
+
+  1. Get final state map: {cellID → state}
+  2. Get ancestry map: {cellID → ancestryID}
+  3. Count colony sizes: for each original ancestor, count S1 descendants
+  4. A colony "survives" if it has ≥ 4 S1 cells (clonogenic threshold)
+  5. Surviving Fraction = (number of surviving colonies) / (initial cell count)
+
+  With 1000 cells and 5 replicates, the minimum detectable SF is ~0.001.
+
+
+================================================================================
+PART 9:  MULTI-COMPONENT ENERGY PARAMETERS AND THEIR ROLES
+================================================================================
+
+NEW PARAMETERS (Er/Ep model):
+
+  Nc  (half-saturation DSB count)
+  ──────────────────────────────
+    Controls h(N) = N/(N+Nc), the fraction of injected energy going to Ep.
+    Small Nc (e.g., 30):  Even low doses create significant persistent damage.
+    Large Nc (e.g., 300): Only high doses create significant persistent damage.
+    Nc → ∞: Effectively disables the Er/Ep split (all energy is repairable).
+    Biologically motivated range: 100–300 DSBs.
+
+  ωp  (persistent energy weight, omega_p)
+  ─────────────────────────────────────────
+    Weights Ep in E_eff = Er + ωp × Ep, used for:
+      - S2 recovery/catastrophe transitions
+      - Mitotic catastrophe check
+    ωp = 1.0: Persistent damage equally effective as repairable.
+    ωp > 1.0: Persistent damage MORE effective (biologically plausible:
+              complex DSBs are harder to repair and more likely to
+              produce lethal chromosomal aberrations).
+    Biologically motivated range: 1.0–2.5.
+
+  λp  (persistent decay rate, lambda_p)
+  ────────────────────────────────────────
+    Controls Ep decay: Ep(t) = Ep(0) × exp(−λp × t).
+    Half-life = 0.693/λp.
+    λp = 0.05/h: t½ = 13.9h (very slow repair)
+    λp = 0.10/h: t½ = 6.9h  (moderate slow repair)
+    λp = 0.17/h: t½ = 4.1h  (faster slow repair)
+    Biologically motivated range: 0.05–0.17/h (t½ = 4–14h).
+    Corresponds to the slow component of DSB rejoining kinetics
+    (complex DSBs requiring HR or alternative pathways).
+
+EXISTING PARAMETERS (calibrated per cell line):
+
+  e2, e3  (reduced state energy thresholds)
+  ──────────────────────────────────────────
+    E2 = e2 × σ    E3 = e3 × σ   (σ = 10.0 by convention)
+    E2: energy level of the arrest attractor (S2 state)
+    E3: energy level of the death attractor (S3 state)
+    Typical calibrated: e2 ≈ 2.5–3.1,  e3 ≈ 5.7–6.6
+
+  a  (DSB-to-energy conversion, reduced)
+  ────────────────────────────────────────
+    α = a × σ    (physical units: energy per DSB)
+    Maps DSB count to energy: dE = α × N_DSB
+    With κ = 40 DSB/Gy:  E_per_Gy = α × κ
+    Typical calibrated: a ≈ 0.016–0.031
+
+  k_error  (misrepair rate constant)
+  ────────────────────────────────────
+    Controls the misrepair-on-recovery channel in S2.
+    Converted to energy units: k_error_energy = k_error / α
+    λ_mis = k_error_energy × Er
+    Typical calibrated: k_error ≈ 0.0001–0.01
+    Cell lines with low k_error (CHO-10B, V79): misrepair negligible
+    Cell lines with high k_error (C3H10T1/2): misrepair significant
+
+  T21, T23  (S2 observation timescales)
+  ──────────────────────────────────────
+    When using fitted timescales: T21 = T23 = 10h (cell cycle time)
+    These set the speed of S2 transitions per time step.
+
+  To12, To13  (S1 observation timescales)
+  ──────────────────────────────────────
+    Currently: To12 = To13 = T_cellCycle = 10h
+    These set the speed of S1 transitions per time step.
+
+
+================================================================================
+PART 10:  COMPLETE FLOW DIAGRAM
+================================================================================
+
+
+                          RADIATION (single acute dose)
+                               |
+                        N_DSB = dose × κ
+                               |
+                    ┌──────────┴──────────┐
+                    |   ENERGY INJECTION   |
+                    |  dE = α × N_DSB      |
+                    └──────────┬──────────┘
+                               |
+                    ┌──────────┴──────────┐
+                    |  PERSISTENT SPLIT    |
+                    |  h = N/(N+Nc)        |
+                    |  dEr = dE×(1-h)      |
+                    |  dEp = dE×h          |
+                    └──────────┬──────────┘
+                               |
+                    ┌──────────┴──────────┐
+                    |  ENERGY DECAY        |
+                    |  Er: bi-exponential   |
+                    |  Ep: mono-exponential |
+                    |  E = Er + Ep         |
+                    |  E_eff = Er + ωp·Ep  |
+                    └──────────┬──────────┘
+                               |
+        ┌──────────────────────┼──────────────────────┐
+        |                      |                      |
+        v                      v                      v
+   ┌─────────┐          ┌───────────┐          ┌─────────┐
+   |   S1    |          |    S2     |          |   S3    |
+   | HEALTHY |          | ARRESTED  |          |  DEAD   |
+   |         |          |           |          |         |
+   | Uses E  |          | Uses E_eff|          |Absorbing|
+   | for     |          | for       |          |         |
+   |overlaps |          | overlaps  |          |         |
+   └────┬────┘          └─────┬─────┘          └─────────┘
+        |                     |                      ▲
+        |   p13 (direct       |                      |
+        |   death, may be     |   p23_cat (catast-   |
+        |   diverted by  ─────┼──→rophe, gated by    |
+        |   checkpoint)       |   checkpoint)        |
+        |                     |                      |
+        |   p12 (arrest, ────→|   p23_mis (misrepair |
+        |   boosted by        |   on recovery try ──→|
+        |   checkpoint)       |   uses Er)           |
+        |                     |                      |
+        |                     |   p21_eff (success-  |
+        |←────────────────────┤   ful recovery)      |
+        |                     |                      |
+        |                     |                      |
+        | If S1 + M phase     |                      |
+        | age > duration:     |                      |
+        | MITOTIC CATAST-     |                      |
+        | ROPHE CHECK ───────────────────────────────→|
+        | (E_eff vs 0.7×E3)  |                      |
+        |                     |                      |
+        | If survives:        |                      |
+        | DIVISION            |                      |
+        | → 2 daughters       |                      |
+        |   (E=0, S1, G0)    |                      |
+        |                     |                      |
+
+
+TIMELINE FOR A TYPICAL IRRADIATED CELL:
+═══════════════════════════════════════
+
+  t=0:  Radiation delivers N DSBs.
+        dE_inj = α×N, split into Er and Ep via h(N).
+        INSTANTANEOUS transition probabilities applied.
+        High damage → likely S1→S2 (or S1→S3 if extreme).
+
+  t=0 to ~1h:
+        Er decays rapidly (fast component, τ1=3h scaled).
+        Ep decays slowly (τ_p=4-14h).
+        If in S2: checkpoint gating suppresses catastrophe.
+        Cell cycle FROZEN (only S1 can cycle).
+
+  t=1h to ~10h:
+        Er continues decaying. Ep still significant.
+        E_eff = Er + ωp×Ep may still be elevated due to Ep.
+        Recovery probability increases as E_eff → 0.
+        Misrepair probability decreases as Er → 0.
+        Checkpoint gating gradually releases.
+
+  t=10h to 27.8h (assay time):
+        Most Er is repaired. Ep may still contribute.
+        Recovered (S1) cells begin cycling:
+          G0→G1→S→G2→M→Division
+        Mitotic catastrophe check at M phase exit.
+        Daughters created with E=0 (clean).
+
+  t=27.8h: Colony assay.
+        Count ancestry groups with ≥4 S1 cells.
+        SF = surviving colonies / initial cells.
+
+
+================================================================================
+PART 11:  PARAMETER CROSS-REFERENCE TABLE
+================================================================================
+
+Parameter        Symbol    Default    Source/Set By               Used In
+──────────       ──────    ───────    ────────────                ────────
+alpha            α         varies     Calibration (a×σ)           Energy injection
+sigma            σ         10.0       Convention                  All overlaps
+E1               E1        0.0        Fixed                       S2 recovery overlap
+E2               E2        varies     Calibration (e2×σ)          S1→S2, S2 overlaps
+E3               E3        varies     Calibration (e3×σ)          S1→S3, S2→S3, mitosis
+k_error          k_err     varies     Calibration                 S2 misrepair channel
+To12             To12      10.0h      Set to T_cellCycle          S1→S2 delayed prob
+To13             To13      10.0h      Set to T_cellCycle          S1→S3 delayed prob
+To21             To21      10.0h*     Set to fitted T21           S2→S1 delayed prob
+To23             To23      10.0h*     Set to fitted T23           S2→S3 delayed prob
+Nc               Nc        30.0       Grid scan / Optuna          h(N) persistent split
+omega_p          ωp        1.5        Grid scan / Optuna          E_eff = Er + ωp×Ep
+lambda_p         λp        0.03       Grid scan / Optuna          Ep decay rate
+f1               f1        0.62       Experimental DSB repair     Er bi-exp decay
+f2               f2        0.38       Experimental DSB repair     Er bi-exp decay
+lambda1          λ1        3.31×0.1   Experimental (scaled)       Er fast component
+lambda2          λ2        0.14×0.1   Experimental (scaled)       Er slow component
+fG1,fS,fG2,fM   f_phase   varies     Literature/convention       Phase-adjusted E2,E3
+k_hold           k_hold    1.5        Checkpoint design           E_hold = E3 − k×σ
+w_hold           w_hold    8.0        Checkpoint design           Logistic width
+eta              η         1.0        Checkpoint design           Diversion strength
+q_gate           q_gate    1.5        Checkpoint design           Gating power
+sigmaT_hold      σ_T       0.5        Checkpoint design           Lognormal hold width
+kappa            κ         40         Literature (DSBs per Gy)    DSB count = dose × κ
+
+* To21/To23: currently set to fitted T21/T23=10h in latest test runs.
+  Earlier tests used effective_repair_time ≈ 29h (mismatch with calibration).
+
+
+================================================================================
+PART 12:  KNOWN LIMITATIONS AND MODEL ASSUMPTIONS
+================================================================================
+
+  1. SINGLE ACUTE DOSE: DSBs are delivered in ONE time step. No dose-rate
+     effects, fractionation, or protracted exposure are modeled by default.
+
+  2. UNIFORM DSB DISTRIBUTION: All cells receive the same number of DSBs
+     (unless --poisson-dsb flag is used for Poisson sampling).
+
+  3. NO INTERCELLULAR SIGNALING: Cells do not influence each other's state
+     transitions (no bystander effect in state model, though bystander
+     signal parameters exist in the data structures).
+
+  4. DAUGHTERS ARE CLEAN: Division produces cells with E=0. In reality,
+     some damage may persist through mitosis (e.g., 53BP1 bodies).
+
+  5. S2 CELLS CANNOT CYCLE: The model strictly prevents S2 cells from
+     progressing through the cell cycle. In reality, some checkpoint
+     adaptation allows cycling with unrepaired damage.
+
+  6. ENERGY IS ABSTRACT: The "state energy" E is not a physical energy
+     in Joules; it's a dimensionless mapping from DSB counts to a
+     position on the state landscape defined by E1, E2, E3, σ.
+
+  7. Er/Ep PARAMETERS ARE NOT INDEPENDENTLY MEASURED: Nc, ωp, λp are
+     currently determined by fitting (grid scan or Optuna) against the
+     same survival data used for the other 6 parameters.
+
+  8. NO LET DEPENDENCE: The model does not explicitly depend on radiation
+     quality (LET). Different radiation types would need different Nc
+     values (higher-LET → more complex damage → lower effective Nc).
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
