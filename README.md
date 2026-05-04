@@ -30,8 +30,16 @@ RADCellSimulation/
 ├── PhysicalBioTranslator/        # Cell state/phase models (Geant4-independent)
 │   ├── include/
 │   ├── src/
+│   ├── test_multicomponent_validation.cc   # Main validation executable
 │   └── test_phaseTransition.cc
 │
+├── CellStateModelCalibration/    # Analytical calibration library
+│   ├── include/
+│   ├── src/
+│   └── test_repair_mediated_calibration.cc
+│
+├── PIDE3.4/                      # PIDE experimental database
+├── PIDEDataReader/               # PIDE data analysis tools
 ├── include/                      # Main project headers
 ├── src/                          # Main project sources
 └── python_wrapper/               # Python bindings via SWIG
@@ -56,10 +64,19 @@ Simulates bystander signal propagation:
 ### PhysicalBioTranslator
 Models biological cell responses:
 - Cell cycle phase progression (G1 → S → G2 → M)
-- Cell state transitions based on damage/stress
+- Cell state transitions (S1/S2/S3) based on damage energy
+- Multi-component energy model (Er repairable + Ep persistent)
 - Contact inhibition and quiescence (G0)
+- Mitotic catastrophe for cells dividing with high damage
 - Cell division mechanics
 - **Geant4-independent** - can be used standalone
+
+### CellStateModelCalibration
+Analytical calibration library for cell state model parameters:
+- 5-parameter `RepairMediatedCalibrator` (e2, e3, a, T21, T23)
+- 6-parameter `RepairMediatedMisrepairCalibrator` (adds k_error)
+- Nelder-Mead optimizer with negative log-likelihood objective
+- Survival curve prediction from calibrated parameters
 
 ## Requirements
 
@@ -346,22 +363,132 @@ python3 plot_calibration_validation.py
 
 ---
 
+## Cell State Transition Model with Multi-Component Energy (v1.0)
+
+The cell state model simulates how cells transition between three states after radiation exposure:
+- **S1 (Healthy)**: Normal functioning, capable of division
+- **S2 (Damaged/Arrested)**: DNA damage detected, repair underway
+- **S3 (Dead)**: Irreversibly damaged, removed from population
+
+### Multi-Component Energy Model (Er + Ep)
+
+The model distinguishes between two types of DNA damage energy:
+
+- **Er (Repairable energy)**: Decays via bi-exponential kinetics (fast + slow DNA repair)
+- **Ep (Persistent energy)**: Decays slowly with rate lambda_p, representing damage that resists normal repair
+
+When N DSBs are induced, the injected energy is split using a nonlinear saturation function:
+
+```
+h(N) = N / (N + Nc)              -- persistent fraction
+dEr_inj = (1 - h(N)) * alpha * N -- repairable component
+dEp_inj = h(N) * alpha * N       -- persistent component
+E_eff = Er + omega_p * Ep        -- effective energy for state transitions
+```
+
+Three cell-line-specific parameters control the Er/Ep dynamics:
+
+| Parameter | Symbol | Description | Typical Range |
+|-----------|--------|-------------|---------------|
+| Half-saturation DSB count | Nc | Controls persistent damage fraction | 10-500 |
+| Persistent energy weight | omega_p | Weight of Ep in effective energy | 0.3-3.0 |
+| Persistent decay rate | lambda_p | Slow repair rate for Ep (1/hr) | 0.005-0.2 |
+
+### Standardized Calibration Pipeline
+
+The v1.0 pipeline consists of three steps:
+
+**Step 1: Analytical Calibration (6-parameter)**
+
+Uses `RepairMediatedMisrepairCalibrator` to fit (e2, e3, a, k_error, T21, T23) to experimental LQ survival data via Nelder-Mead optimization. The 6-param calibrator is used even though k_error is disabled in simulation, because it helps find better e2/e3/a values.
+
+**Step 2: Er/Ep Parameter Optimization (Latin Hypercube Sampling)**
+
+Per-cell-line optimization of (Nc, omega_p, lambda_p):
+1. Generate 15 LHS samples + 1 baseline (ErEp disabled)
+2. Run all simulations in parallel (5 workers)
+3. Select the parameter combination with lowest error per cell line
+
+Completes in ~5.6 minutes for 5 cell lines (9.3x faster than Optuna).
+
+**Step 3: Fine Validation**
+
+Production-quality simulation: 1000 cells, 5 replicates, 10 dose points (0-6 Gy).
+
+### Running the Standard Pipeline
+
+```bash
+# Build
+cd build
+cmake -DGeant4_DIR=/path/to/geant4/lib/cmake/Geant4 ../RADCellSimulation
+make -j$(nproc) test_multicomponent_validation
+
+# Run LHS parameter search (from build/PhysicalBioTranslator/)
+python3 lhs_surrogate_search.py
+
+# Run fine validation with optimized parameters
+./test_multicomponent_validation \
+  --pide-dir /path/to/PIDE3.4 \
+  --cells 1000 --replicates 5 --max-cell-types 5 \
+  --use-fitted-timescales \
+  --no-checkpoint --no-misrepair --force-6param-calib \
+  --params-file lhs_surrogate_results/best_params_percell.csv \
+  --output-dir ./validation_output
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--use-fitted-timescales` | Use T21=T23=10h from calibration |
+| `--no-checkpoint` | Disable damage diversion and S2 gating |
+| `--no-misrepair` | Disable misrepair channel (k_error=0 in simulation) |
+| `--force-6param-calib` | Use 6-param calibrator despite --no-misrepair |
+| `--params-file` | Load per-cell-line Nc, omega_p, lambda_p from CSV |
+
+### Validated Results (5 Cell Lines, 60Co)
+
+| Cell Line | alpha | beta | Nc | omega_p | lambda_p | Avg Error |
+|-----------|-------|------|----|---------|----------|-----------|
+| CHO-10B | 0.235 | 0.031 | 20.6 | 0.380 | 0.045 | 0.037 |
+| HS-23 | 0.340 | 0.028 | 208.5 | 0.845 | 0.014 | 0.047 |
+| C3H10T1/2 | 0.391 | 0.021 | 483.3 | 2.914 | 0.090 | 0.086 |
+| V79 | 0.189 | 0.013 | 20.6 | 0.380 | 0.045 | 0.023 |
+| AG1522 | 0.337 | 0.109 | 67.2 | 0.643 | 0.046 | 0.171 |
+| **Overall** | | | | | | **0.073** |
+
+Error metric: avg |log10(SF_sim) - log10(SF_exp)| across dose points.
+
+### Extending to New Cell Lines
+
+1. Obtain experimental alpha and beta (LQ parameters) from PIDE database or literature
+2. Add cell line to `CELL_LINES` in `lhs_surrogate_search.py` and run (~5 min per cell line)
+3. Fine validation with best parameters (~3 min per cell line)
+4. Target: AvgLog10Error < 0.1 (good) or < 0.15 (acceptable)
+
+For full technical details, see `ProjectSummary_CellStateModel_v1.md`.
+
+---
+
 ## Key Features
 
 - **Modular Design**: Components can be developed and tested independently
 - **Geant4 Integration**: Full Monte Carlo radiation transport
-- **Multi-threaded**: Supports Geant4 multi-threading
+- **Multi-threaded**: Supports Geant4 multi-threading and OpenMP parallelization
+- **Multi-Component Energy Model**: Er/Ep split with cell-line-specific persistent damage
+- **Automated Calibration**: 6-param analytical calibration + LHS parameter optimization
+- **Fast Pipeline**: ~8 minutes to calibrate and validate a new cell line
 - **Python Bindings**: SWIG-generated Python interface
-- **Optimized**: Pre-computed constants and efficient algorithms
+- **PIDE Integration**: Direct access to experimental survival data from the PIDE 3.4 database
 
 ## References
 
-This simulation framework is based on research in radiation-induced bystander effects. Key concepts include:
+This simulation framework is based on research in radiation-induced bystander effects and cell state transition modeling. Key concepts include:
 
 1. Radiation-induced bystander effect (RIBE) modeling
 2. Cell cycle kinetics and phase transitions
 3. Reaction-diffusion equations for signal propagation
 4. DNA damage quantification and cellular response
+5. Multi-component damage models (repairable vs persistent)
+6. Cell state transition theory for radiation survival prediction
 
 ## Author
 
@@ -374,5 +501,5 @@ This project is provided for academic and research purposes.
 
 ---
 
-*RADCell_optimized - December 2024*
+*RADCell_optimized - May 2026 (v1.0)*
 
